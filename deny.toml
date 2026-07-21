@@ -1,0 +1,57 @@
+# cargo-deny configuration — the enforcement half of ADR-0021.
+# Runs in the required `audit` CI job once a Cargo project exists. Lifting any
+# ban or widening the license list = a consensus-surface change: it happens in
+# the same PR as the ADR that authorizes it, never on its own.
+
+[graph]
+# Dev-dependencies are exempt from license/ban checks: dev tooling may be
+# looser (ADR-0017 allows dev-only serde_json), the shipped binary may not.
+# They still appear in review via the Cargo.toml diff.
+exclude-dev = true
+
+[advisories]
+version = 2
+ignore = []
+
+[licenses]
+version = 2
+# Only what kenny itself ships under (MIT) plus the permissive licenses its
+# expected leaf deps carry. cargo-deny denies anything not listed, so a new
+# license fails CI and forces a conscious decision.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "CC0-1.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# ADR-0021: framework crates that dictate program shape are banned by default.
+deny = [
+    # Async runtimes — sync-first per ADR-0016; async only with a measured reason.
+    { crate = "tokio", reason = "async runtime; ADR-0016 says sync-first, decided by M3 numbers" },
+    { crate = "async-std", reason = "async runtime; ADR-0016" },
+    { crate = "smol", reason = "async runtime; ADR-0016" },
+    # Serde family — hand-rolled minimal JSON per ADR-0017 (dev-only use is
+    # exempt via exclude-dev, per ADR-0021).
+    { crate = "serde", reason = "serialization framework; ADR-0017 hand-rolls the JSON subset" },
+    { crate = "serde_derive", reason = "serde family; ADR-0017" },
+    { crate = "serde_json", reason = "serde family; ADR-0017 (dev-only use allowed via exclude-dev)" },
+    # Error-macro crates — thin custom error enums are the convention.
+    { crate = "anyhow", reason = "error-crate zoo; conventions require thin custom enums" },
+    { crate = "thiserror", reason = "error-crate zoo; conventions require thin custom enums" },
+    # CLI framework — args are hand-rolled.
+    { crate = "clap", reason = "CLI framework; kenny hand-rolls its small arg surface" },
+    # Randomness — determinism is a feature; the seeded RNG is hand-rolled.
+    { crate = "rand", reason = "determinism: hand-rolled seeded RNG (SplitMix64)" },
+    # Native TLS — if TLS ever enters, it is rustls (ADR-0016).
+    { crate = "openssl-sys", reason = "native TLS; rustls if TLS is ever needed (ADR-0016)" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

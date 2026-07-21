@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  # Run on every pull request. Deliberately no path filters: `check` and
+  # `audit` are required status checks, and a PR touching none of the filtered
+  # paths would leave them perpetually "Expected", blocking the merge.
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint ADRs and doc structure
+        run: ./tools/check-adr.sh
+      - name: Lint agent definitions
+        run: ./tools/check-agents.sh
+      # Workflow rule: every PR closes its issue (Closes #N is the standard —
+      # the merge closes it), or declares an explicit exception with a
+      # "No-Issue: <reason>" line. The PR body goes through an env var, never
+      # interpolated into the script (untrusted input).
+      - name: PR links an issue
+        if: github.event_name == 'pull_request'
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          if grep -qiE '(close[sd]?|fix(e[sd])?|resolve[sd]?) #[0-9]+' <<<"$PR_BODY"; then
+            echo "OK: PR closes an issue"
+          elif grep -qE '^No-Issue: .+' <<<"$PR_BODY"; then
+            echo "OK: explicit No-Issue exception declared"
+          else
+            echo "FAIL: PR body must contain 'Closes #N' (the standard — the merge closes the issue)"
+            echo "or an explicit 'No-Issue: <reason>' line when no issue applies."
+            exit 1
+          fi
+      # kenny is docs-first: pre-M0 there is no Cargo project yet. The Rust
+      # steps arm themselves automatically the moment Cargo.toml lands.
+      - name: Detect Rust project
+        id: rust
+        run: |
+          if [[ -f Cargo.toml ]]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "No Cargo.toml yet (pre-M0) — Rust steps skipped"
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.rust.outputs.present == 'true'
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        if: steps.rust.outputs.present == 'true'
+      - run: cargo fmt --check
+        if: steps.rust.outputs.present == 'true'
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+        if: steps.rust.outputs.present == 'true'
+      # Fast-path: PR and branch pushes run debug-mode tests. Release-mode
+      # tests run only on tag pushes (v*), right before a version is cut.
+      - name: Test (debug — PR / branch push)
+        if: steps.rust.outputs.present == 'true' && !startsWith(github.ref, 'refs/tags/v')
+        run: cargo test
+        timeout-minutes: 8
+      - name: Test (release — tag push)
+        if: steps.rust.outputs.present == 'true' && startsWith(github.ref, 'refs/tags/v')
+        run: cargo test --release
+        timeout-minutes: 10
+
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - uses: actions/checkout@v4
+      - name: Detect Rust project
+        id: rust
+        run: |
+          if [[ -f Cargo.toml ]]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
+      # Pre-code: the policy file must already exist and carry the ADR-0021
+      # bans, so the gate is armed before the first crate ever lands.
+      - name: Deny policy armed (pre-code)
+        if: steps.rust.outputs.present == 'false'
+        run: |
+          test -f deny.toml || { echo "FAIL: deny.toml missing"; exit 1; }
+          status=0
+          for crate in tokio async-std smol serde anyhow thiserror clap rand openssl-sys; do
+            if ! grep -q "crate = \"$crate\"" deny.toml; then
+              echo "FAIL: deny.toml missing ban for $crate (ADR-0021)"
+              status=1
+            fi
+          done
+          [ "$status" -eq 0 ] && echo "OK: deny.toml present, ADR-0021 bans armed (no Cargo project yet)"
+          exit $status
+      # Install precompiled cargo-audit + cargo-deny instead of compiling them
+      # from source. taiki-e/install-action downloads prebuilt binaries.
+      - name: Install cargo-audit and cargo-deny
+        if: steps.rust.outputs.present == 'true'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
+      # Cache the rustsec advisory database between runs so cargo-audit
+      # doesn't refetch it each time; rotate per run id so it never goes stale.
+      - name: Cache rustsec advisory-db
+        if: steps.rust.outputs.present == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/advisory-db
+          key: advisory-db-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            advisory-db-${{ runner.os }}-
+      - run: cargo audit
+        if: steps.rust.outputs.present == 'true'
+      - run: cargo deny check
+        if: steps.rust.outputs.present == 'true'
