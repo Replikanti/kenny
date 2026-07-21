@@ -308,8 +308,11 @@ const GOLDEN_MANIFEST_IDENTITY_FP8: &str =
     "7d00d51564a26942182a9aa3df3bcf73f44d9fc3cf95bd020625db175b36d6e5";
 const GOLDEN_MANIFEST_IDENTITY_INT8: &str =
     "e465b37199d63782ce02841e5bde7ad053c0a383579c34414e60f61840756264";
-// Thresholds measured on the default fixture, set with margin below the
-// observed floor; a regression past these means the quantizer moved.
+// Thresholds measured on the default fixture (fp8 worst cosine 0.99883,
+// int8 worst 0.99998), set with margin below the observed floor. Mutation
+// testing showed the tight int8 arm is the binding guard for the shared
+// carve/dequant paths (a gate/up scale swap passes the looser fp8 gate);
+// the fp8 arm mainly binds the e4m3 codec itself.
 const FP8_MIN_COSINE: f64 = 0.995;
 const INT8_MIN_COSINE: f64 = 0.9998;
 

@@ -1,8 +1,14 @@
 //! KNY1 expert blob — consensus format, version 1 (ADR-0005).
 //!
-//! Fixed little-endian layout; every field below is part of the hashed bytes,
-//! so any change here is a CID-breaking format change: bump `VERSION`, write
-//! the ADR, update the golden tests — in that order, in one PR.
+//! Fixed little-endian layout; every field below is part of the hashed bytes.
+//! Change protocol: a STRUCTURAL change (field offsets, widths, order, or the
+//! meaning of existing bytes) is CID-breaking — bump `VERSION`, write the
+//! ADR, update the golden tests, in that order, in one PR. ADDITIVE dtype-tag
+//! registration (a new tag value, loudly rejected by older decoders, zero
+//! byte impact on existing blobs) needs the authorizing ADR and a row in the
+//! table below, but NOT a version bump — bumping would re-encode the version
+//! field of every future blob and orphan nothing but goldens. Tags 1/2 were
+//! added under ADR-0012 this way; bf16 goldens are unchanged.
 //!
 //! ```text
 //! offset  size  field
@@ -244,7 +250,11 @@ impl<'a> Decoded<'a> {
         }
         let i4 = self.header.inter as usize * 4;
         let h4 = self.header.hidden as usize * 4;
-        debug_assert_eq!(self.scale.len(), 2 * i4 + h4, "validated by decode");
+        // decode() guarantees this for blobs it produced; a hand-built
+        // Decoded must not be able to trigger a slice panic here.
+        if self.scale.len() != 2 * i4 + h4 {
+            return Err(Error::parse("blob: scale block length disagrees with dims"));
+        }
         Ok((
             &self.scale[..i4],
             &self.scale[i4..2 * i4],
@@ -398,6 +408,39 @@ mod tests {
             decode(&bf_blob).unwrap().scale_parts().is_err(),
             "bf16 has no scales"
         );
+    }
+
+    // Golden CIDs for the quantized layouts: lock dtype tags 1/2, the scale
+    // block, and payload order directly at the blob level (the manifest
+    // goldens lock them only transitively). Same change protocol as
+    // golden_cid_v1.
+    #[test]
+    fn golden_cid_quantized() {
+        let h = Header {
+            layer: 1,
+            expert: 2,
+            dtype: Dtype::Fp8,
+            hidden: 4,
+            inter: 2,
+        };
+        let scale: Vec<u8> = (0..32u8).collect(); // (2 + 2 + 4) rows * 4 bytes
+        let m: Vec<u8> = (0..8u8).collect(); // 2x4 / 4x2 at 1 byte per elem
+        let fp8_blob = encode(&h, &scale, &m, &m, &m).unwrap();
+        assert_eq!(
+            cid(&fp8_blob),
+            "be278cbdfb536beaba145a27b7d62acb68b9ef7e2de24289e2a98d175090fd68"
+        );
+
+        let h = Header {
+            dtype: Dtype::Int8,
+            ..h
+        };
+        let int8_blob = encode(&h, &scale, &m, &m, &m).unwrap();
+        assert_eq!(
+            cid(&int8_blob),
+            "37fb559e354cbbdea02198a1b810cba2361c79eba95dbed903954c56d3533ed9"
+        );
+        assert_ne!(cid(&fp8_blob), cid(&int8_blob), "dtype tag is hashed");
     }
 
     #[test]

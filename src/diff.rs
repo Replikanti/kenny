@@ -112,23 +112,40 @@ pub fn run(model_dir: &Path, carved_dir: &Path, opts: &DiffOptions) -> Result<Di
         .map(|(t, s)| (t.as_str(), s.as_str()))
         .collect();
     let mut shards: BTreeMap<String, ShardFile> = BTreeMap::new();
-    let mut source_matrix = |layer: u16, expert: u16, proj: &str| -> Result<Vec<f32>> {
-        let name = format!("model.layers.{layer}.mlp.experts.{expert}.{proj}.weight");
-        let shard_name = *tensor_shard.get(name.as_str()).ok_or_else(|| {
-            Error::parse(format!("diff: tensor {name:?} not found in the model dir"))
-        })?;
-        if !shards.contains_key(shard_name) {
-            shards.insert(
-                shard_name.to_string(),
-                ShardFile::open(&model.dir.join(shard_name))?,
-            );
-        }
-        let shard = &shards[shard_name];
-        let meta = shard
-            .tensor(&name)
-            .ok_or_else(|| Error::parse(format!("diff: {name:?} missing from {shard_name:?}")))?;
-        quant::bf16_to_f32_vec(shard.bytes(meta))
-    };
+    // The expected shape is part of the lookup: a model dir that does not
+    // match the manifest must produce a clean error, never a garbage verdict
+    // (or a panic downstream in forward()).
+    let mut source_matrix =
+        |layer: u16, expert: u16, proj: &str, rows: usize, cols: usize| -> Result<Vec<f32>> {
+            let name = format!("model.layers.{layer}.mlp.experts.{expert}.{proj}.weight");
+            let shard_name = *tensor_shard.get(name.as_str()).ok_or_else(|| {
+                Error::parse(format!("diff: tensor {name:?} not found in the model dir"))
+            })?;
+            if !shards.contains_key(shard_name) {
+                shards.insert(
+                    shard_name.to_string(),
+                    ShardFile::open(&model.dir.join(shard_name))?,
+                );
+            }
+            let shard = &shards[shard_name];
+            let meta = shard.tensor(&name).ok_or_else(|| {
+                Error::parse(format!("diff: {name:?} missing from {shard_name:?}"))
+            })?;
+            if meta.dtype != "BF16" {
+                return Err(Error::parse(format!(
+                    "diff: {name:?} is {}, expected BF16 sources",
+                    meta.dtype
+                )));
+            }
+            if meta.shape != [rows as u64, cols as u64] {
+                return Err(Error::parse(format!(
+                    "diff: {name:?} has shape {:?}, the manifest implies [{rows}, {cols}] — \
+                     is this the model the carve came from?",
+                    meta.shape
+                )));
+            }
+            quant::bf16_to_f32_vec(shard.bytes(meta))
+        };
 
     // Deterministic activation batch.
     let xs: Vec<Vec<f32>> = (0..opts.batch)
@@ -175,9 +192,9 @@ pub fn run(model_dir: &Path, carved_dir: &Path, opts: &DiffOptions) -> Result<Di
                 )
             }
         };
-        let rg = source_matrix(entry.layer, entry.expert, "gate_proj")?;
-        let ru = source_matrix(entry.layer, entry.expert, "up_proj")?;
-        let rd = source_matrix(entry.layer, entry.expert, "down_proj")?;
+        let rg = source_matrix(entry.layer, entry.expert, "gate_proj", inter, hidden)?;
+        let ru = source_matrix(entry.layer, entry.expert, "up_proj", inter, hidden)?;
+        let rd = source_matrix(entry.layer, entry.expert, "down_proj", hidden, inter)?;
 
         let mut max_abs = 0f64;
         let (mut dot, mut n_ref, mut n_car) = (0f64, 0f64, 0f64);
