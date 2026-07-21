@@ -17,8 +17,10 @@ beefy workstation down to the Raspberry Pi in your drawer.
 - Built for **async agent farms** — hundreds of parallel streams, aggregate
   throughput. Explicitly not a chatbot.
 
-**Status:** paperwork phase (pre-M0). No code yet — the what and the why are
-nailed down first.
+**Status:** M0 in progress. `kenny fixture` and `kenny carve` exist — fixture
+→ content-addressed expert blobs + canonical manifest → bit-exact round-trip,
+locked by golden hashes. Numeric diff (`kenny diff`) and quantized carve modes
+are next.
 
 - The what and why: [docs/MANIFESTO.md](docs/MANIFESTO.md)
 - The decisions: [docs/ADR/](docs/ADR/)

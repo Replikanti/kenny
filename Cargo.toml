@@ -1,0 +1,18 @@
+[package]
+name = "kenny"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Distributed MoE expert pool — offline carve tooling (M0)"
+repository = "https://github.com/Replikanti/kenny"
+
+[dependencies]
+# blake3: content addressing — CIDs for expert blobs and the manifest identity
+# (ADR-0005). Cryptographic hashing is the one thing we never hand-roll, and
+# the upstream implementation is SIMD-tuned, which matters when a carve hashes
+# hundreds of GB.
+blake3 = "1"
+# memmap2: mmap safetensors shards so carve slices exact byte ranges without
+# loading multi-GB files into RAM (shards run ~4 GB, GLM-class repos run TBs).
+# Leaf crate per ADR-0021.
+memmap2 = "0.9"

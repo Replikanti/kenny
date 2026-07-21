@@ -23,6 +23,11 @@ allow = [
     "Apache-2.0",
     "Apache-2.0 WITH LLVM-exception",
     "CC0-1.0",
+    # BSD-2-Clause: pulled in by `arrayref` (transitive leaf of blake3, the
+    # ADR-0005 hashing dependency). Permissive, no copyleft — the conscious
+    # decision ADR-0021's license clause demands, recorded here and in the
+    # PR that added it.
+    "BSD-2-Clause",
 ]
 
 [bans]
