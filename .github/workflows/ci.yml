@@ -7,7 +7,11 @@ on:
   # Run on every pull request. Deliberately no path filters: `check` and
   # `audit` are required status checks, and a PR touching none of the filtered
   # paths would leave them perpetually "Expected", blocking the merge.
+  # `edited` is included because the PR-links-an-issue gate reads the PR body
+  # (the `Closes #N` line lives there) — fixing the body must retrigger the
+  # check without demanding an empty push.
   pull_request:
+    types: [opened, synchronize, reopened, edited]
 
 concurrency:
   group: ci-${{ github.ref }}
