@@ -1,8 +1,14 @@
 //! KNY1 expert blob — consensus format, version 1 (ADR-0005).
 //!
-//! Fixed little-endian layout; every field below is part of the hashed bytes,
-//! so any change here is a CID-breaking format change: bump `VERSION`, write
-//! the ADR, update the golden tests — in that order, in one PR.
+//! Fixed little-endian layout; every field below is part of the hashed bytes.
+//! Change protocol: a STRUCTURAL change (field offsets, widths, order, or the
+//! meaning of existing bytes) is CID-breaking — bump `VERSION`, write the
+//! ADR, update the golden tests, in that order, in one PR. ADDITIVE dtype-tag
+//! registration (a new tag value, loudly rejected by older decoders, zero
+//! byte impact on existing blobs) needs the authorizing ADR and a row in the
+//! table below, but NOT a version bump — bumping would re-encode the version
+//! field of every future blob and orphan nothing but goldens. Tags 1/2 were
+//! added under ADR-0012 this way; bf16 goldens are unchanged.
 //!
 //! ```text
 //! offset  size  field
@@ -10,14 +16,18 @@
 //! 4       2     version (u16) = 1
 //! 6       2     layer (u16)
 //! 8       2     expert (u16)
-//! 10      1     dtype (u8): 0 = bf16
+//! 10      1     dtype (u8): 0 = bf16, 1 = fp8 e4m3 (per-channel),
+//!               2 = int8 (per-channel)
 //! 11      1     pad, must be 0
 //! 12      4     hidden (u32)
 //! 16      4     inter (u32) — moe_intermediate
-//! 20      4     scale_len (u32) — 0 for bf16
-//! 24      ..    scale block (scale_len bytes)
-//! 24+s    ..    payload: gate_proj, up_proj, down_proj — row-major source
-//!               bytes, each hidden*inter*dtype_size long
+//! 20      4     scale_len (u32) — 0 for bf16;
+//!               4 * (inter + inter + hidden) for fp8/int8
+//! 24      ..    scale block: per-output-row f32 LE scales — gate rows
+//!               (inter), then up rows (inter), then down rows (hidden);
+//!               dequant is w[r, c] = decode(q[r, c]) * scale[r]
+//! 24+s    ..    payload: gate_proj, up_proj, down_proj — row-major bytes,
+//!               each hidden*inter*dtype_size long
 //! ```
 //!
 //! CID = lowercase blake3 hex of the entire blob (header + scale + payload).
@@ -33,12 +43,16 @@ pub const HEADER_LEN: usize = 24;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dtype {
     Bf16 = 0,
+    Fp8 = 1,
+    Int8 = 2,
 }
 
 impl Dtype {
     pub fn from_u8(v: u8) -> Result<Dtype> {
         match v {
             0 => Ok(Dtype::Bf16),
+            1 => Ok(Dtype::Fp8),
+            2 => Ok(Dtype::Int8),
             other => Err(Error::parse(format!("blob: unknown dtype tag {other}"))),
         }
     }
@@ -46,12 +60,10 @@ impl Dtype {
     pub fn from_name(name: &str) -> Result<Dtype> {
         match name {
             "bf16" => Ok(Dtype::Bf16),
-            "fp8" | "int8" => Err(Error::parse(format!(
-                "dtype {name:?} is not implemented yet (M0 is bf16 passthrough; fp8/int8 arrive \
-                 with the kenny diff milestone, ADR-0018 pending)"
-            ))),
+            "fp8" => Ok(Dtype::Fp8),
+            "int8" => Ok(Dtype::Int8),
             other => Err(Error::parse(format!(
-                "unknown dtype {other:?} (expected bf16)"
+                "unknown dtype {other:?} (expected bf16, fp8 or int8)"
             ))),
         }
     }
@@ -59,19 +71,23 @@ impl Dtype {
     pub fn size(self) -> u64 {
         match self {
             Dtype::Bf16 => 2,
+            Dtype::Fp8 | Dtype::Int8 => 1,
         }
     }
 
     pub fn name(self) -> &'static str {
         match self {
             Dtype::Bf16 => "bf16",
+            Dtype::Fp8 => "fp8",
+            Dtype::Int8 => "int8",
         }
     }
 
-    /// Source safetensors dtype this carve mode accepts.
+    /// Source safetensors dtype this carve mode accepts (quantized modes read
+    /// bf16 sources and quantize centrally, ADR-0012).
     pub fn source_dtype(self) -> &'static str {
         match self {
-            Dtype::Bf16 => "BF16",
+            Dtype::Bf16 | Dtype::Fp8 | Dtype::Int8 => "BF16",
         }
     }
 }
@@ -96,12 +112,31 @@ impl Header {
     }
 }
 
+/// Scale-block length implied by the header: 0 for bf16, one f32 per output
+/// row (gate: inter, up: inter, down: hidden) for quantized dtypes.
+pub fn expected_scale_len(dtype: Dtype, hidden: u32, inter: u32) -> Result<usize> {
+    match dtype {
+        Dtype::Bf16 => Ok(0),
+        Dtype::Fp8 | Dtype::Int8 => (inter as u64)
+            .checked_add(inter as u64)
+            .and_then(|n| n.checked_add(hidden as u64))
+            .and_then(|n| n.checked_mul(4))
+            .and_then(|n| usize::try_from(n).ok())
+            .ok_or_else(|| Error::parse("blob: scale block size overflows")),
+    }
+}
+
 pub fn encode(h: &Header, scale: &[u8], gate: &[u8], up: &[u8], down: &[u8]) -> Result<Vec<u8>> {
     if h.hidden == 0 || h.inter == 0 {
         return Err(Error::parse("blob: zero dimension"));
     }
-    if h.dtype == Dtype::Bf16 && !scale.is_empty() {
-        return Err(Error::parse("blob: bf16 blobs carry no scale block"));
+    let want_scale = expected_scale_len(h.dtype, h.hidden, h.inter)?;
+    if scale.len() != want_scale {
+        return Err(Error::parse(format!(
+            "blob: {} scale bytes, {} dtype needs exactly {want_scale}",
+            scale.len(),
+            h.dtype.name()
+        )));
     }
     let msize = h.matrix_len()?;
     for (name, m) in [("gate", gate), ("up", up), ("down", down)] {
@@ -173,8 +208,12 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded<'_>> {
     if hidden == 0 || inter == 0 {
         return Err(Error::parse("blob: zero dimension"));
     }
-    if dtype == Dtype::Bf16 && scale_len != 0 {
-        return Err(Error::parse("blob: bf16 blob with nonempty scale block"));
+    if scale_len != expected_scale_len(dtype, hidden, inter)? {
+        return Err(Error::parse(format!(
+            "blob: scale block is {scale_len} bytes, {} dtype implies {}",
+            dtype.name(),
+            expected_scale_len(dtype, hidden, inter)?
+        )));
     }
     let msize = header.matrix_len()?;
     // Checked u64 math: a crafted header must yield a clean error, never a
@@ -200,6 +239,28 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded<'_>> {
         up: &bytes[p + msize..p + 2 * msize],
         down: &bytes[p + 2 * msize..p + 3 * msize],
     })
+}
+
+impl<'a> Decoded<'a> {
+    /// Split the scale block into (gate, up, down) per-row f32 LE scales.
+    /// Errors for bf16 blobs, which carry none.
+    pub fn scale_parts(&self) -> Result<(&'a [u8], &'a [u8], &'a [u8])> {
+        if self.header.dtype == Dtype::Bf16 {
+            return Err(Error::parse("blob: bf16 blobs have no scale block"));
+        }
+        let i4 = self.header.inter as usize * 4;
+        let h4 = self.header.hidden as usize * 4;
+        // decode() guarantees this for blobs it produced; a hand-built
+        // Decoded must not be able to trigger a slice panic here.
+        if self.scale.len() != 2 * i4 + h4 {
+            return Err(Error::parse("blob: scale block length disagrees with dims"));
+        }
+        Ok((
+            &self.scale[..i4],
+            &self.scale[i4..2 * i4],
+            &self.scale[2 * i4..2 * i4 + h4],
+        ))
+    }
 }
 
 pub fn cid(bytes: &[u8]) -> String {
@@ -314,6 +375,72 @@ mod tests {
             cid(&blob),
             "7494d99e6b53f11e6fcef0868f84add97ba0ee7d1bd3fa8e08017859af6cedb9"
         );
+    }
+
+    #[test]
+    fn quantized_roundtrip_and_scale_split() {
+        let h = Header {
+            layer: 1,
+            expert: 2,
+            dtype: Dtype::Int8,
+            hidden: 4,
+            inter: 2,
+        };
+        // gate/up: 2x4 = 8 bytes each; down: 4x2 = 8 bytes; scales: (2+2+4)*4.
+        let scale: Vec<u8> = (0..32u8).collect();
+        let m: Vec<u8> = (0..8u8).collect();
+        let blob = encode(&h, &scale, &m, &m, &m).unwrap();
+        let d = decode(&blob).unwrap();
+        assert_eq!(d.header.dtype, Dtype::Int8);
+        let (sg, su, sd) = d.scale_parts().unwrap();
+        assert_eq!(sg, &scale[..8]);
+        assert_eq!(su, &scale[8..16]);
+        assert_eq!(sd, &scale[16..32]);
+        // Wrong scale length is rejected on both sides.
+        assert!(encode(&h, &scale[..31], &m, &m, &m).is_err());
+        let bf = Header {
+            dtype: Dtype::Bf16,
+            ..h
+        };
+        let m2: Vec<u8> = (0..16u8).collect();
+        let bf_blob = encode(&bf, &[], &m2, &m2, &m2).unwrap();
+        assert!(
+            decode(&bf_blob).unwrap().scale_parts().is_err(),
+            "bf16 has no scales"
+        );
+    }
+
+    // Golden CIDs for the quantized layouts: lock dtype tags 1/2, the scale
+    // block, and payload order directly at the blob level (the manifest
+    // goldens lock them only transitively). Same change protocol as
+    // golden_cid_v1.
+    #[test]
+    fn golden_cid_quantized() {
+        let h = Header {
+            layer: 1,
+            expert: 2,
+            dtype: Dtype::Fp8,
+            hidden: 4,
+            inter: 2,
+        };
+        let scale: Vec<u8> = (0..32u8).collect(); // (2 + 2 + 4) rows * 4 bytes
+        let m: Vec<u8> = (0..8u8).collect(); // 2x4 / 4x2 at 1 byte per elem
+        let fp8_blob = encode(&h, &scale, &m, &m, &m).unwrap();
+        assert_eq!(
+            cid(&fp8_blob),
+            "be278cbdfb536beaba145a27b7d62acb68b9ef7e2de24289e2a98d175090fd68"
+        );
+
+        let h = Header {
+            dtype: Dtype::Int8,
+            ..h
+        };
+        let int8_blob = encode(&h, &scale, &m, &m, &m).unwrap();
+        assert_eq!(
+            cid(&int8_blob),
+            "37fb559e354cbbdea02198a1b810cba2361c79eba95dbed903954c56d3533ed9"
+        );
+        assert_ne!(cid(&fp8_blob), cid(&int8_blob), "dtype tag is hashed");
     }
 
     #[test]

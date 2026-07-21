@@ -9,11 +9,14 @@ pub mod bf16;
 pub mod blob;
 pub mod carve;
 pub mod cli;
+pub mod diff;
 pub mod error;
 pub mod fixture;
+pub mod fp8;
 pub mod json;
 pub mod manifest;
 pub mod natsort;
+pub mod quant;
 pub mod rng;
 pub mod safetensors;
 

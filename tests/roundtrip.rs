@@ -11,6 +11,7 @@ use std::process::Command;
 
 use kenny::blob::{self, Dtype};
 use kenny::carve::{self, Options};
+use kenny::diff;
 use kenny::fixture::{self, Params};
 use kenny::manifest::Manifest;
 use kenny::safetensors::{self, ShardFile};
@@ -292,17 +293,164 @@ fn cli_smoke() {
     assert_eq!(st.code(), Some(2), "missing args is a usage error");
     let st = Command::new(bin).args(["frobnicate"]).status().unwrap();
     assert_eq!(st.code(), Some(2), "unknown command is a usage error");
-    // fp8 is declared but not implemented in M0 — must fail loudly, not fall
-    // back to bf16.
     let st = Command::new(bin)
         .args(["carve"])
         .arg(&model)
         .args(["--out"])
         .arg(root.join("x"))
-        .args(["--dtype", "fp8"])
+        .args(["--dtype", "bogus"])
         .status()
         .unwrap();
-    assert_eq!(st.code(), Some(2), "unimplemented dtype is refused");
+    assert_eq!(st.code(), Some(2), "unknown dtype is refused");
+}
+
+const GOLDEN_MANIFEST_IDENTITY_FP8: &str =
+    "7d00d51564a26942182a9aa3df3bcf73f44d9fc3cf95bd020625db175b36d6e5";
+const GOLDEN_MANIFEST_IDENTITY_INT8: &str =
+    "e465b37199d63782ce02841e5bde7ad053c0a383579c34414e60f61840756264";
+// Thresholds measured on the default fixture (fp8 worst cosine 0.99883,
+// int8 worst 0.99998), set with margin below the observed floor. Mutation
+// testing showed the tight int8 arm is the binding guard for the shared
+// carve/dequant paths (a gate/up scale swap passes the looser fp8 gate);
+// the fp8 arm mainly binds the e4m3 codec itself.
+const FP8_MIN_COSINE: f64 = 0.995;
+const INT8_MIN_COSINE: f64 = 0.9998;
+
+#[test]
+fn quantized_carve_and_diff() {
+    let root = tmp("qdiff");
+    let model_dir = root.join("model");
+    fixture::generate(&Params::default(), &model_dir).unwrap();
+
+    let mut identities = Vec::new();
+    for dtype in [Dtype::Bf16, Dtype::Fp8, Dtype::Int8] {
+        let out = root.join(dtype.name());
+        let s = carve::run(
+            &model_dir,
+            &Options {
+                out: out.clone(),
+                model_name: "fixture".into(),
+                model_rev: String::new(),
+                dtype,
+            },
+        )
+        .unwrap();
+        identities.push(s.manifest_identity.clone());
+
+        for layer in [0u16, 1] {
+            let r = diff::run(
+                &model_dir,
+                &out,
+                &diff::DiffOptions {
+                    layer,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(r.per_expert.len(), 4);
+            eprintln!(
+                "{} layer {layer}: exact={} max_abs={:.3e} cosine={:.8}",
+                dtype.name(),
+                r.bitwise_exact,
+                r.worst_max_abs,
+                r.worst_cosine
+            );
+            match dtype {
+                Dtype::Bf16 => {
+                    assert!(r.bitwise_exact, "bf16 passthrough must be bit-exact");
+                    assert_eq!(r.worst_max_abs, 0.0);
+                }
+                Dtype::Fp8 => {
+                    assert!(!r.per_expert.is_empty());
+                    assert!(
+                        r.worst_cosine >= FP8_MIN_COSINE,
+                        "fp8 cosine {}",
+                        r.worst_cosine
+                    );
+                }
+                Dtype::Int8 => {
+                    assert!(
+                        r.worst_cosine >= INT8_MIN_COSINE,
+                        "int8 cosine {}",
+                        r.worst_cosine
+                    );
+                }
+            }
+        }
+    }
+    assert_ne!(
+        identities[0], identities[1],
+        "dtype changes the model identity"
+    );
+    assert_ne!(identities[1], identities[2]);
+    assert_eq!(identities[1], GOLDEN_MANIFEST_IDENTITY_FP8, "fp8 identity");
+    assert_eq!(
+        identities[2], GOLDEN_MANIFEST_IDENTITY_INT8,
+        "int8 identity"
+    );
+
+    // Asking for a layer that has no experts is a clear error.
+    assert!(
+        diff::run(
+            &model_dir,
+            &root.join("bf16"),
+            &diff::DiffOptions {
+                layer: 7,
+                ..Default::default()
+            }
+        )
+        .is_err()
+    );
+}
+
+/// Full real-model round-trip: carve all 6,144 Qwen3-30B-A3B experts (bf16
+/// passthrough) and bit-exactly diff layer 0. Gated on KENNY_MODEL_DIR; a
+/// re-run is cheap because existing blobs dedup-skip (hash-only pass).
+#[test]
+fn real_model_full_carve_and_diff() {
+    let Some(dir) = std::env::var_os("KENNY_MODEL_DIR") else {
+        eprintln!("KENNY_MODEL_DIR unset — skipping real-model carve + diff");
+        return;
+    };
+    let model_dir = PathBuf::from(dir);
+    let out = Path::new(env!("CARGO_TARGET_TMPDIR")).join("real-carve-bf16");
+    fs::create_dir_all(&out).unwrap();
+    let t0 = std::time::Instant::now();
+    let s = carve::run(
+        &model_dir,
+        &Options {
+            out: out.clone(),
+            model_name: "qwen3-30b-a3b".into(),
+            model_rev: String::new(),
+            dtype: Dtype::Bf16,
+        },
+    )
+    .unwrap();
+    eprintln!(
+        "real carve: {} blobs ({} new bytes, {} dedup) in {:.1?}",
+        s.blobs,
+        s.blob_bytes,
+        s.dedup_skipped,
+        t0.elapsed()
+    );
+    assert_eq!(s.blobs, 6144, "Qwen3-30B-A3B routed expert count");
+    assert_eq!((s.moe_layers, s.experts_per_layer), (48, 128));
+    assert_eq!((s.hidden, s.inter), (2048, 768));
+
+    let t1 = std::time::Instant::now();
+    let r = diff::run(&model_dir, &out, &diff::DiffOptions::default()).unwrap();
+    eprintln!(
+        "real diff layer 0: exact={} max_abs={:.3e} cosine={:.8} in {:.1?}",
+        r.bitwise_exact,
+        r.worst_max_abs,
+        r.worst_cosine,
+        t1.elapsed()
+    );
+    assert_eq!(r.per_expert.len(), 128);
+    assert!(
+        r.bitwise_exact,
+        "bf16 passthrough must be bit-exact on the real model"
+    );
 }
 
 /// Gated on KENNY_MODEL_DIR (repo convention: CI never downloads models).

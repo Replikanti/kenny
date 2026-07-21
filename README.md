@@ -17,10 +17,10 @@ beefy workstation down to the Raspberry Pi in your drawer.
 - Built for **async agent farms** — hundreds of parallel streams, aggregate
   throughput. Explicitly not a chatbot.
 
-**Status:** M0 in progress. `kenny fixture` and `kenny carve` exist — fixture
-→ content-addressed expert blobs + canonical manifest → bit-exact round-trip,
-locked by golden hashes. Numeric diff (`kenny diff`) and quantized carve modes
-are next.
+**Status:** M0 complete. Real Qwen3-30B-A3B carves into 6,144
+content-addressed expert blobs in ~67 s on a laptop and reassembles
+**bit-exactly** (`kenny diff`); fp8/int8 per-channel carve modes are measured
+in [BENCH.md](BENCH.md). Next: M1 — the dispatch/gather protocol.
 
 - The what and why: [docs/MANIFESTO.md](docs/MANIFESTO.md)
 - The decisions: [docs/ADR/](docs/ADR/)
