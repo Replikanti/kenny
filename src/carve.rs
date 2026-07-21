@@ -55,6 +55,18 @@ type ExpertGrid = BTreeMap<(u16, u16), [Option<(String, String)>; 3]>;
 /// Anything else touching `.mlp.experts.` is a hard error — an unrecognized
 /// expert-family tensor (quant scales, renamed projections) must stop the
 /// carve, not silently land on the spine ("trust but verify", ADR-0007).
+/// Digits only, no leading zeros, no signs — `u16::parse` alone would accept
+/// "007" and "+7", which could never round-trip back into a tensor name.
+fn parse_index(s: &str) -> Option<u16> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if s.len() > 1 && s.starts_with('0') {
+        return None;
+    }
+    s.parse::<u16>().ok()
+}
+
 fn classify(name: &str) -> Result<Class> {
     let segs: Vec<&str> = name.split('.').collect();
     if segs.len() == 8
@@ -70,8 +82,8 @@ fn classify(name: &str) -> Result<Class> {
             "down_proj" => Some(Proj::Down),
             _ => None,
         };
-        if let (Ok(layer), Ok(expert), Some(proj)) =
-            (segs[2].parse::<u16>(), segs[5].parse::<u16>(), proj)
+        if let (Some(layer), Some(expert), Some(proj)) =
+            (parse_index(segs[2]), parse_index(segs[5]), proj)
         {
             return Ok(Class::Expert {
                 layer,
@@ -409,6 +421,8 @@ mod tests {
             "model.layers.0.mlp.experts.0.gate_proj.weight_scale",
             "model.layers.0.mlp.experts.0.qkv_proj.weight",
             "model.layers.0.mlp.experts.70000.gate_proj.weight",
+            "model.layers.007.mlp.experts.0.gate_proj.weight",
+            "model.layers.0.mlp.experts.+7.gate_proj.weight",
         ] {
             assert!(classify(name).is_err(), "{name}");
         }

@@ -17,6 +17,10 @@ use kenny::safetensors::{self, ShardFile};
 
 const GOLDEN_MANIFEST_IDENTITY: &str =
     "f3776ff47bf10cdd9e5c849d1b8f596f9e44300b7d6e4f45d41b4998aa00bde5";
+// Locks the fixture generator end to end: safetensors writer layout, RNG
+// streams, bf16 rounding. Same change protocol as the other goldens.
+const GOLDEN_FIXTURE_SHARD1: &str =
+    "0ec0a9fb04c8c74d64da66b20436779f184a29b50b0ec9c5b71e90fbf2cb50b3";
 
 fn tmp(name: &str) -> PathBuf {
     let p = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
@@ -213,6 +217,11 @@ fn golden_manifest_identity() {
     let model_dir = root.join("model");
     fixture::generate(&Params::default(), &model_dir).unwrap();
     let summary = carve::run(&model_dir, &opts(root.join("carved"))).unwrap();
+    assert_eq!(
+        blob::cid(&fs::read(model_dir.join("model-00001-of-00002.safetensors")).unwrap()),
+        GOLDEN_FIXTURE_SHARD1,
+        "fixture shard bytes changed — generator, safetensors writer, RNG or bf16 moved"
+    );
     assert_eq!(
         summary.manifest_identity, GOLDEN_MANIFEST_IDENTITY,
         "manifest identity for the default fixture changed — that means the canonical \

@@ -177,8 +177,15 @@ pub fn decode(bytes: &[u8]) -> Result<Decoded<'_>> {
         return Err(Error::parse("blob: bf16 blob with nonempty scale block"));
     }
     let msize = header.matrix_len()?;
-    let expect = HEADER_LEN + scale_len + 3 * msize;
-    if bytes.len() != expect {
+    // Checked u64 math: a crafted header must yield a clean error, never a
+    // debug-overflow panic — this decoder is the seam that will face
+    // pool-fetched bytes from M1 on.
+    let expect = (msize as u64)
+        .checked_mul(3)
+        .and_then(|p| p.checked_add(HEADER_LEN as u64))
+        .and_then(|p| p.checked_add(scale_len as u64))
+        .ok_or_else(|| Error::parse("blob: header implies an impossible size"))?;
+    if bytes.len() as u64 != expect {
         return Err(Error::parse(format!(
             "blob: {} bytes, header implies exactly {expect}",
             bytes.len()
@@ -261,6 +268,23 @@ mod tests {
         assert!(decode(&bad).is_err(), "oversized");
 
         assert!(decode(&blob[..10]).is_err(), "short header");
+    }
+
+    #[test]
+    fn overflow_header_is_rejected_not_panicking() {
+        // hidden * inter chosen so matrix_len fits u64 but 3 * msize wraps.
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&MAGIC);
+        bad.extend_from_slice(&VERSION.to_le_bytes());
+        bad.extend_from_slice(&0u16.to_le_bytes()); // layer
+        bad.extend_from_slice(&0u16.to_le_bytes()); // expert
+        bad.push(0); // dtype bf16
+        bad.push(0); // pad
+        bad.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // hidden
+        bad.extend_from_slice(&0x8000_0000u32.to_le_bytes()); // inter
+        bad.extend_from_slice(&0u32.to_le_bytes()); // scale_len
+        bad.extend_from_slice(&[0u8; 16]);
+        assert!(decode(&bad).is_err());
     }
 
     #[test]

@@ -217,6 +217,13 @@ impl Manifest {
                 .as_str()
                 .ok_or_else(|| Error::parse("manifest: expert cid is not a string"))?;
             check_cid(cid)?;
+            if layer as u32 >= model.moe_layers || expert as u32 >= model.experts_per_layer {
+                return Err(Error::parse(format!(
+                    "manifest: expert (layer {layer}, expert {expert}) is outside the \
+                     {}x{} grid the model block promises",
+                    model.moe_layers, model.experts_per_layer
+                )));
+            }
             experts.push(ExpertEntry {
                 layer,
                 expert,
@@ -402,9 +409,14 @@ mod tests {
         let v = json::parse(&dup.canonical_bytes()).unwrap();
         assert!(Manifest::from_value(&v).is_err(), "duplicate entry");
 
-        let mut bad_cid = m;
+        let mut bad_cid = m.clone();
         bad_cid.experts[0].cid = "zz".into();
         let v = json::parse(&bad_cid.canonical_bytes()).unwrap();
         assert!(Manifest::from_value(&v).is_err(), "malformed cid");
+
+        let mut off_grid = m;
+        off_grid.experts[0].layer = 5;
+        let v = json::parse(&off_grid.canonical_bytes()).unwrap();
+        assert!(Manifest::from_value(&v).is_err(), "out-of-grid entry");
     }
 }
