@@ -1,6 +1,6 @@
 # ADR-0017: JSON and serde policy — hand-rolled minimal parsing
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-07-21
 
 ## Context

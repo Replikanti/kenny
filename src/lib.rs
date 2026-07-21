@@ -1,0 +1,20 @@
+//! kenny — distributed MoE expert pool. M0: offline carve tooling.
+//!
+//! Read `docs/MANIFESTO.md` and `docs/ADR/` before touching formats: the blob
+//! (`src/blob.rs`) and manifest (`src/manifest.rs`) encodings are consensus
+//! surfaces (ADR-0005) — CIDs hash their exact bytes, so byte-layout changes
+//! are format-version events with an ADR, never refactors.
+
+pub mod bf16;
+pub mod blob;
+pub mod carve;
+pub mod cli;
+pub mod error;
+pub mod fixture;
+pub mod json;
+pub mod manifest;
+pub mod natsort;
+pub mod rng;
+pub mod safetensors;
+
+pub use error::{Error, Result};
