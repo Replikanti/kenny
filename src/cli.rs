@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use crate::blob::Dtype;
 use crate::carve;
+use crate::diff;
 use crate::error::{Error, Result};
 use crate::fixture;
 
@@ -23,11 +24,17 @@ USAGE:
         Print every tensor name (natural order) with its shard file. Run this
         against a real model before carving it — trust the schema, but verify.
 
-    kenny carve <model_dir> --out <dir> [--dtype bf16]
+    kenny carve <model_dir> --out <dir> [--dtype bf16|fp8|int8]
                 [--model-name NAME] [--model-rev REV]
         Cut routed experts into content-addressed blobs (blobs/<xx>/<cid>)
-        and write the canonical manifest (manifest.json). M0 supports bf16
-        passthrough; --model-name defaults to the model directory name.
+        and write the canonical manifest (manifest.json). bf16 = byte-exact
+        passthrough; fp8/int8 = central per-channel quantization (ADR-0012).
+        --model-name defaults to the model directory name.
+
+    kenny diff <model_dir> <carved_dir> [--layer N] [--batch N] [--seed N]
+        Recompute y = down(silu(gate.x) * (up.x)) for every expert of one MoE
+        layer, from source tensors and from carved blobs, and compare. bf16
+        carves must match bit-for-bit; fp8/int8 report max-abs and cosine.
 ";
 
 pub fn run(args: &[String]) -> Result<()> {
@@ -38,6 +45,7 @@ pub fn run(args: &[String]) -> Result<()> {
         }
         Some("fixture") => run_fixture(&args[1..]),
         Some("carve") => run_carve(&args[1..]),
+        Some("diff") => run_diff(&args[1..]),
         Some(other) => Err(Error::usage(format!("unknown command {other:?}"))),
     }
 }
@@ -183,5 +191,75 @@ fn run_carve(args: &[String]) -> Result<()> {
     println!("spine:    {} tensors recorded by range", s.spine_tensors);
     println!("manifest: {}", s.manifest_path.display());
     println!("identity: {}", s.manifest_identity);
+    Ok(())
+}
+
+fn run_diff(args: &[String]) -> Result<()> {
+    let mut opts = diff::DiffOptions::default();
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--layer" => {
+                opts.layer = parse_num(
+                    value(args, &mut i, "--layer")?,
+                    "--layer",
+                    0,
+                    u16::MAX as u64,
+                )? as u16;
+            }
+            "--batch" => {
+                opts.batch =
+                    parse_num(value(args, &mut i, "--batch")?, "--batch", 1, 4096)? as usize;
+            }
+            "--seed" => {
+                opts.seed = parse_num(value(args, &mut i, "--seed")?, "--seed", 0, u64::MAX)?
+            }
+            flag if flag.starts_with('-') => {
+                return Err(Error::usage(format!("diff: unknown flag {flag:?}")));
+            }
+            path => dirs.push(PathBuf::from(path)),
+        }
+        i += 1;
+    }
+    let [model_dir, carved_dir] = dirs.as_slice() else {
+        return Err(Error::usage(
+            "diff: exactly two directories required: <model_dir> <carved_dir>",
+        ));
+    };
+    let r = diff::run(model_dir, carved_dir, &opts)?;
+    let worst_abs = r
+        .per_expert
+        .iter()
+        .max_by(|a, b| a.max_abs.total_cmp(&b.max_abs))
+        .expect("at least one expert");
+    let worst_cos = r
+        .per_expert
+        .iter()
+        .min_by(|a, b| a.cosine.total_cmp(&b.cosine))
+        .expect("at least one expert");
+    println!(
+        "diff:     layer {} ({}), {} experts x batch {}",
+        r.layer,
+        r.dtype.name(),
+        r.per_expert.len(),
+        r.batch
+    );
+    println!(
+        "exact:    {}",
+        if r.bitwise_exact {
+            "yes (bit-for-bit)"
+        } else {
+            "no"
+        }
+    );
+    println!(
+        "max-abs:  {:.3e} (worst: expert {})",
+        r.worst_max_abs, worst_abs.expert
+    );
+    println!(
+        "cosine:   {:.8} (worst: expert {})",
+        r.worst_cosine, worst_cos.expert
+    );
     Ok(())
 }

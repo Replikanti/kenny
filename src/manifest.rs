@@ -217,11 +217,14 @@ impl Manifest {
                 .as_str()
                 .ok_or_else(|| Error::parse("manifest: expert cid is not a string"))?;
             check_cid(cid)?;
-            if layer as u32 >= model.moe_layers || expert as u32 >= model.experts_per_layer {
+            // Expert indices are 0-based within a layer; layer indices are the
+            // model's own (GLM's MoE layers start at 3), so they are checked
+            // as a set below, not against a 0-based bound.
+            if expert as u32 >= model.experts_per_layer {
                 return Err(Error::parse(format!(
-                    "manifest: expert (layer {layer}, expert {expert}) is outside the \
-                     {}x{} grid the model block promises",
-                    model.moe_layers, model.experts_per_layer
+                    "manifest: expert (layer {layer}, expert {expert}) exceeds the \
+                     {} experts per layer the model block promises",
+                    model.experts_per_layer
                 )));
             }
             experts.push(ExpertEntry {
@@ -241,6 +244,17 @@ impl Manifest {
         seen.sort_unstable();
         if seen.windows(2).any(|w| w[0] == w[1]) {
             return Err(Error::parse("manifest: duplicate (layer, expert) entry"));
+        }
+        // Count + per-layer expert bound + uniqueness + this distinct-layer
+        // count force exactly moe_layers full layers (pigeonhole).
+        let mut layers: Vec<u16> = seen.iter().map(|&(l, _)| l).collect();
+        layers.dedup();
+        if layers.len() as u64 != model.moe_layers as u64 {
+            return Err(Error::parse(format!(
+                "manifest: {} distinct MoE layers, model block promises {}",
+                layers.len(),
+                model.moe_layers
+            )));
         }
 
         let mut spine = Vec::new();
@@ -414,9 +428,31 @@ mod tests {
         let v = json::parse(&bad_cid.canonical_bytes()).unwrap();
         assert!(Manifest::from_value(&v).is_err(), "malformed cid");
 
-        let mut off_grid = m;
+        let mut off_grid = m.clone();
         off_grid.experts[0].layer = 5;
         let v = json::parse(&off_grid.canonical_bytes()).unwrap();
-        assert!(Manifest::from_value(&v).is_err(), "out-of-grid entry");
+        assert!(Manifest::from_value(&v).is_err(), "layer-set mismatch");
+
+        let mut big_expert = m;
+        big_expert.experts[0].expert = 7;
+        let v = json::parse(&big_expert.canonical_bytes()).unwrap();
+        assert!(
+            Manifest::from_value(&v).is_err(),
+            "expert index out of bounds"
+        );
+    }
+
+    #[test]
+    fn nonzero_based_layers_load() {
+        // GLM-style: MoE layers need not start at 0.
+        let mut m = sample();
+        for e in &mut m.experts {
+            e.layer = 3;
+        }
+        let v = json::parse(&m.canonical_bytes()).unwrap();
+        assert!(
+            Manifest::from_value(&v).is_ok(),
+            "layer indices are the model's own"
+        );
     }
 }

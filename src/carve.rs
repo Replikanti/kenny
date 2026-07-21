@@ -13,6 +13,7 @@ use crate::blob::{self, Dtype, Header};
 use crate::error::{Error, Result};
 use crate::manifest::{ExpertEntry, Manifest, ModelInfo, SpineEntry};
 use crate::natsort::natural_cmp;
+use crate::quant;
 use crate::safetensors::{self, ShardFile};
 
 pub struct Options {
@@ -263,11 +264,15 @@ pub fn run(model_dir: &Path, opts: &Options) -> Result<CarveSummary> {
     let write_expert =
         |&(layer, expert): &(u16, u16), worker: usize| -> Result<(ExpertEntry, u64, bool)> {
             let triple = &experts[&(layer, expert)];
-            let mut mats: [&[u8]; 3] = [&[], &[], &[]];
+            let mut srcs: [(&[u8], usize, usize); 3] = [(&[], 0, 0); 3];
             for (i, slot) in triple.iter().enumerate() {
                 let (tensor, shard_name) = slot.as_ref().expect("validated above");
                 let (shard, meta) = locate(tensor, shard_name)?;
-                mats[i] = shard.bytes(meta);
+                srcs[i] = (
+                    shard.bytes(meta),
+                    meta.shape[0] as usize,
+                    meta.shape[1] as usize,
+                );
             }
             let header = Header {
                 layer,
@@ -276,7 +281,21 @@ pub fn run(model_dir: &Path, opts: &Options) -> Result<CarveSummary> {
                 hidden,
                 inter,
             };
-            let bytes = blob::encode(&header, &[], mats[0], mats[1], mats[2])?;
+            let bytes = match opts.dtype {
+                Dtype::Bf16 => blob::encode(&header, &[], srcs[0].0, srcs[1].0, srcs[2].0)?,
+                dt => {
+                    // Central quantization (ADR-0012): per-output-row scales,
+                    // concatenated gate ++ up ++ down in the scale block.
+                    let mut scale_block = Vec::new();
+                    let mut mats: Vec<Vec<u8>> = Vec::with_capacity(3);
+                    for &(src, rows, cols) in &srcs {
+                        let (scales, data) = quant::quantize_matrix(dt, src, rows, cols)?;
+                        scale_block.extend_from_slice(&scales);
+                        mats.push(data);
+                    }
+                    blob::encode(&header, &scale_block, &mats[0], &mats[1], &mats[2])?
+                }
+            };
             let cid = blob::cid(&bytes);
             let path = blobs_dir.join(blob::rel_path(&cid));
             let entry = ExpertEntry { layer, expert, cid };
