@@ -31,6 +31,14 @@ what turns a WAN pool from slow into unusable.
 - The timeout budget is a quality/latency knob: too tight renorms too often
   (quality dip per ADR-0008), too loose readmits the tail. It ships as a
   measured default, not a guess.
+- **Measured at M3** (`tc netem`, BENCH "M3"): at 1 % loss the per-layer timeout
+  (90 ms ≈ 3·RTT) caps step p99 with a timeout rate ≤ 5.2 % of layer-steps, and
+  the 2-node hedge fires on 3.56 % of layer-steps to collapse p99 4.89 s → 3.57 s
+  (−27 %) with **renorm rate 0** — the redundant secondary rescues every stall, so
+  the hedged path is quality-safe. This closes the "hedge rate + timeout budget
+  measured at M3 before any WAN deployment" promise above; the single-node timeout
+  alone gives a coarser cap (degenerate whole-layer renorm), so the hedge is what
+  makes the tail control quality-safe.
 
 ## Alternatives considered
 
