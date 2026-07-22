@@ -36,6 +36,7 @@ use memmap2::Mmap;
 use crate::error::{Error, Result};
 use crate::manifest::{Manifest, SpineEntry};
 use crate::node::Node;
+use crate::placement::{HeatMap, PlacementMap};
 use crate::quant;
 use crate::wire::{Dispatch, ExpertStatus, Gather, Handshake, Transport, WireCodec};
 
@@ -384,6 +385,16 @@ pub trait Dispatcher {
     /// Read into `GenStats` at the end of a run, like `layer_timeouts`.
     fn hedges_fired(&self) -> u64 {
         0
+    }
+
+    /// Spine-local dead/never-answering-replica suspects observed over this
+    /// dispatcher's life (the ADR-0008 alarm feed, ADR-0009's re-replication
+    /// trigger): `(layer, expert)` pairs a holder was dispatched at least once but
+    /// answered `not-held` on EVERY dispatch. Empty for dispatchers without a heat
+    /// map (`LocalDispatch`, `NodeDispatch`, `HedgedDispatch`); [`PlacedDispatch`]
+    /// derives it from its fan-out heat log. Read at the end of a run.
+    fn suspect_replicas(&self) -> Vec<(u16, u16)> {
+        Vec::new()
     }
 }
 
@@ -926,6 +937,264 @@ impl Dispatcher for HedgedDispatch {
 
     fn hedges_fired(&self) -> u64 {
         self.hedges_fired
+    }
+}
+
+/// One node's slice of a stream's routed experts, carried as `(routed position,
+/// expert)` so a gather reassembles into ROUTED ORDER (the `mix_moe` invariant).
+type SubList = Vec<(usize, u16)>;
+
+/// A node's fan-out work for one layer-step: `(stream index, its sub-list)` for
+/// every batched stream that has ≥ 1 expert on this node at the current replica
+/// depth.
+type NodeWork = Vec<(usize, SubList)>;
+
+/// Multi-node PLACED dispatch (ADR-0009 / ADR-0024): the M4 core. Owns one
+/// `NodeDispatch` connection per pool node plus a [`PlacementMap`]
+/// (`(layer, expert) -> replica set of node indices`), and fans a layer's routed
+/// experts out to their holding nodes — each node is sent the sub-list of experts
+/// it holds as ordinary `Dispatch` (KNYD) frames on its own connection, the
+/// `Gather` (KNYG) frames come back, and the per-expert `y`s are reassembled into
+/// ROUTED ORDER so the `mix_moe` renorm (ADR-0008) is byte-identical to a
+/// `LocalDispatch` step. This is the first path that ever placed DISTINCT experts
+/// on DISTINCT nodes (M1–M3 were a single node, or the `HedgedDispatch` mirror
+/// pair where both nodes held everything).
+///
+/// It composes on the EXISTING wire (ADR-0024, the placement analogue of ADR-0023
+/// batching): no envelope frame, `WIRE_VERSION` stays 1, every codec version
+/// stays 1, and every wire golden stays byte-identical. An expert no node holds
+/// (empty replica set) is a *placement hole* → `None` → the pre-existing
+/// not-held → renorm path; `src/node.rs` is untouched (a node holding a subset
+/// just answers `not-held` more often).
+///
+/// Hedging (ADR-0010) is unified onto placement here as a *replica-set
+/// second-send*: with `hedge_delay` set, a stalled node's sub-lists spill to
+/// their experts' NEXT replica (round `r` targets the `r`-th replica of each
+/// still-unanswered expert), first-answer-wins. Experts are pure (ADR-0004), so
+/// either replica's `y` is bit-identical and with no loss the primary round
+/// answers everything — the path then reduces exactly to the unhedged fan-out.
+///
+/// The [`HeatMap`], placement map, and per-`(layer, expert)` dispatch/failure
+/// counters are all spine-LOCAL (ADR-0004): never on the wire, never in a
+/// manifest, never cross-node.
+///
+/// Fan-out talks to each holding node in turn (send its sub-lists, then read
+/// them): the placement anchor runs at small `B` and each node's share is a
+/// fraction of the routed set, so send-all-then-read per node is deadlock-free
+/// here — the same posture `HedgedDispatch` takes. The concurrent split-stream
+/// pipeline (per-node writer threads, ADR-0023) is a throughput optimization the
+/// simulated-WAN sim (a later M4 PR) can layer on; it does not change the output.
+pub struct PlacedDispatch {
+    nodes: Vec<NodeDispatch>,
+    map: PlacementMap,
+    /// Spine-local dispatch heat: per-`(layer, expert)` dispatch/failure tallies,
+    /// feeding both re-placement and the ADR-0008 dead-replica alarm
+    /// ([`HeatMap::suspect`]). Recorded off the fan-out, never on the wire.
+    heat: HeatMap,
+    /// `Some(delay)` arms the replica-set hedge: a stalled node's still-unanswered
+    /// experts spill to their next replica after `delay`. `None` (the default) is
+    /// a single primary round — a straggler renorms, no second-send.
+    hedge_delay: Option<Duration>,
+    /// Layer-steps on which the hedge fired (a replica-set second-send ran) —
+    /// read into `GenStats` at the end of a run, like `HedgedDispatch`.
+    hedges_fired: u64,
+}
+
+impl PlacedDispatch {
+    /// Connect one `NodeDispatch` per address (indices matching the `nodes` slice
+    /// the `map`'s replica indices point into) and take ownership of the placement
+    /// map. `hedge_delay` arms the replica-set hedge (clamped to ≥ 1 ms, since a
+    /// zero receive timeout means "block forever"); `None` is the unhedged
+    /// fan-out. Every connection handshakes the same model identity + codec.
+    pub fn connect(
+        addrs: &[String],
+        mut make_codec: impl FnMut() -> Box<dyn WireCodec>,
+        identity: [u8; 32],
+        hidden: usize,
+        map: PlacementMap,
+        hedge_delay: Option<Duration>,
+    ) -> Result<PlacedDispatch> {
+        if addrs.is_empty() {
+            return Err(Error::usage(
+                "spine: placed dispatch needs at least one node",
+            ));
+        }
+        let mut nodes = Vec::with_capacity(addrs.len());
+        for addr in addrs {
+            nodes.push(NodeDispatch::connect(addr, make_codec(), identity, hidden)?);
+        }
+        Ok(PlacedDispatch {
+            nodes,
+            map,
+            heat: HeatMap::new(),
+            hedge_delay: hedge_delay.map(|d| d.max(Duration::from_millis(1))),
+            hedges_fired: 0,
+        })
+    }
+
+    /// The spine-local dispatch heat accumulated over this placed run: the
+    /// ADR-0009 dispatch log and the ADR-0008 dead-replica alarm feed. Read after
+    /// a run to re-steer placement or to surface `heat().suspect(..)` replicas.
+    pub fn heat(&self) -> &HeatMap {
+        &self.heat
+    }
+
+    /// Send this node its sub-lists (one `Dispatch` frame per stream) then read
+    /// the gathers back in send order, filling answered `y`s into `out` at their
+    /// routed positions. A stalled read head-of-line-blocks the rest on this one
+    /// connection, so the tail is left unanswered (it spills to the next replica
+    /// round, or renorms) and the desynced connection is torn down + reconnected.
+    /// With no `deadline` armed the reads block (the unhedged path never stalls).
+    fn fan_to_node(
+        &mut self,
+        layer: u16,
+        node_idx: usize,
+        work: &NodeWork,
+        items: &[(&[f32], &[u16])],
+        deadline: Option<Duration>,
+        out: &mut [Vec<Option<Vec<f32>>>],
+    ) -> Result<()> {
+        let nd = &mut self.nodes[node_idx];
+        for (i, sub) in work {
+            let experts: Vec<u16> = sub.iter().map(|&(_p, e)| e).collect();
+            nd.send_one(layer, items[*i].0, &experts)?;
+        }
+        if let Some(d) = deadline {
+            nd.set_read_deadline(d);
+        }
+        let mut stalled = false;
+        for (i, sub) in work {
+            if stalled {
+                continue;
+            }
+            let experts: Vec<u16> = sub.iter().map(|&(_p, e)| e).collect();
+            match nd.recv_gather_opt(&experts)? {
+                Some(ys) => {
+                    for ((pos, _e), y) in sub.iter().zip(ys) {
+                        out[*i][*pos] = y;
+                    }
+                }
+                None => stalled = true,
+            }
+        }
+        if stalled {
+            nd.reconnect()?;
+        }
+        Ok(())
+    }
+}
+
+impl Dispatcher for PlacedDispatch {
+    fn dispatch(
+        &mut self,
+        layer: u16,
+        x: &[f32],
+        experts: &[u16],
+    ) -> Result<Vec<Option<Vec<f32>>>> {
+        // Single-stream is the width-1 batch (one fan-out, one reassembly).
+        let items: [(&[f32], &[u16]); 1] = [(x, experts)];
+        let mut out = self.dispatch_batch(layer, &items)?;
+        Ok(out.pop().expect("one item -> one result"))
+    }
+
+    /// Fan `B` streams' routed experts out to their holders and reassemble into
+    /// routed order. Round `r` sends every still-unanswered expert to its `r`-th
+    /// replica: round 0 is the primary placement, rounds `r > 0` are the hedge
+    /// (only when `hedge_delay` is set). Output is bit-identical to `LocalDispatch`
+    /// — the fan-out is a pure routing decision over pure experts (ADR-0024).
+    fn dispatch_batch(
+        &mut self,
+        layer: u16,
+        items: &[(&[f32], &[u16])],
+    ) -> Result<Vec<Vec<Option<Vec<f32>>>>> {
+        let mut out: Vec<Vec<Option<Vec<f32>>>> =
+            items.iter().map(|&(_x, e)| vec![None; e.len()]).collect();
+        let mut hedged = false;
+        let mut round = 0usize;
+
+        loop {
+            // This round's work, grouped by the node that is the `round`-th
+            // replica of each still-unanswered expert.
+            let mut by_node: BTreeMap<usize, NodeWork> = BTreeMap::new();
+            for (i, &(_x, experts)) in items.iter().enumerate() {
+                let mut per_node: BTreeMap<usize, SubList> = BTreeMap::new();
+                for (pos, &e) in experts.iter().enumerate() {
+                    if out[i][pos].is_some() {
+                        continue; // already answered (first-answer-wins)
+                    }
+                    if let Some(&node) = self.map.replicas_of(layer, e).get(round) {
+                        per_node.entry(node).or_default().push((pos, e));
+                    }
+                }
+                for (node, sub) in per_node {
+                    by_node.entry(node).or_default().push((i, sub));
+                }
+            }
+            if by_node.is_empty() {
+                break; // nothing left to place at this replica depth
+            }
+            if round > 0 {
+                hedged = true;
+            }
+            // The `round`-th replica gets `hedge_delay` before its work spills to
+            // the next replica; a later round is given the wider hedge budget (a
+            // healthy redundant gather clears in ~one RTT).
+            let deadline = self.hedge_delay.map(|d| {
+                if round == 0 {
+                    d
+                } else {
+                    d.checked_mul(HEDGE_BUDGET_MULT).unwrap_or(d)
+                }
+            });
+            let node_work: Vec<(usize, NodeWork)> = by_node.into_iter().collect();
+            for (node_idx, work) in node_work {
+                self.fan_to_node(layer, node_idx, &work, items, deadline, &mut out)?;
+            }
+            if self.hedge_delay.is_none() {
+                break; // no hedge: one primary round, a straggler renorms
+            }
+            round += 1;
+        }
+        if hedged {
+            self.hedges_fired += 1;
+        }
+
+        // Spine-local heat: one dispatch per ATTEMPTED (non-hole) routed expert
+        // this step, plus a failure mark for any no replica answered — the
+        // ADR-0009 dispatch log + the ADR-0008 dead-replica alarm feed. A
+        // placement hole (no replica) is skipped: it was never dispatched, so it
+        // is a coverage gap, not a dead replica.
+        for (i, &(_x, experts)) in items.iter().enumerate() {
+            for (pos, &e) in experts.iter().enumerate() {
+                if self.map.replicas_of(layer, e).is_empty() {
+                    continue;
+                }
+                self.heat.record_dispatch(layer, e);
+                if out[i][pos].is_none() {
+                    self.heat.note_failure(layer, e);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn wire_bytes(&self) -> (u64, u64) {
+        self.nodes.iter().fold((0, 0), |(u, d), n| {
+            let (nu, nd) = n.wire_bytes();
+            (u + nu, d + nd)
+        })
+    }
+
+    fn hedges_fired(&self) -> u64 {
+        self.hedges_fired
+    }
+
+    /// Experts dispatched at least once whose EVERY dispatch went unanswered
+    /// (100 % failure) — a fully-dead replica set (ADR-0008 alarm / ADR-0009
+    /// re-replication). A cold expert only seeded into the map (0 dispatches) is
+    /// never flagged (`HeatMap::suspect`'s `dispatches > 0` guard).
+    fn suspect_replicas(&self) -> Vec<(u16, u16)> {
+        self.heat.suspect(1, 1, 1)
     }
 }
 

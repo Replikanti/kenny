@@ -857,6 +857,376 @@ fn hedge_fires_and_stays_bit_exact() {
     }
 }
 
+// -------------------------------------------------------------------------
+// M4 — multi-node PLACED dispatch (ADR-0009 / ADR-0024). `PlacedDispatch` fans a
+// layer's routed experts across DISTINCT nodes per a `PlacementMap` and
+// reassembles per-expert `y`s into routed order, so a placed step is bit-for-bit
+// a `LocalDispatch` step — the placement analogue of the ADR-0023 batching
+// equivalence. Everything rides the EXISTING wire (no frame / `WIRE_VERSION`
+// change; the five wire goldens in `src/wire.rs` stay frozen): a placement hole
+// (an expert no node holds) is the pre-existing not-held → renorm path, and
+// hedging is a replica-set second-send. CI-runnable (localhost threads, no netns,
+// no model); the heterogeneous-uplink per-node p99 numbers are the netns sim (a
+// later M4 PR).
+// -------------------------------------------------------------------------
+
+use kenny::placement::{HeatMap, NodeDesc, PlacementMap, build_placement};
+use kenny::spine::PlacedDispatch;
+use std::collections::HashSet;
+
+/// Uniform node descriptors (distinct failure domains, equal capacity) — the
+/// ADR-0009 bootstrap the CLI multi-node path builds when no heat log exists yet.
+fn uniform_nodes(n: usize) -> Vec<NodeDesc> {
+    (0..n)
+        .map(|j| NodeDesc {
+            id: format!("n{j}"),
+            failure_domain: format!("d{j}"),
+            uplink_class: 1,
+            ram_class: 1,
+        })
+        .collect()
+}
+
+/// A bootstrap HeatMap that seeds `experts` cold (`touch`), leaving each key in
+/// `holes` UNPLACED so `build_placement` gives it an empty replica set — a real
+/// placement hole (contrast a held-but-dropped replica).
+fn bootstrap_heat(experts: &[(u16, u16)], holes: &[(u16, u16)]) -> HeatMap {
+    let mut h = HeatMap::new();
+    for &(l, e) in experts {
+        if !holes.contains(&(l, e)) {
+            h.touch(l, e);
+        }
+    }
+    h
+}
+
+fn all_expert_keys(manifest: &Manifest) -> Vec<(u16, u16)> {
+    manifest
+        .experts
+        .iter()
+        .map(|e| (e.layer, e.expert))
+        .collect()
+}
+
+/// Spawn a node that holds ONLY `keep` (drops every other expert in `all_experts`
+/// via the existing `Node::drop_expert` — `src/node.rs` is untouched) and serves
+/// connections in a loop, so a hedge reconnect is re-accepted. `done` + a wake
+/// connection stop it (the `spawn_loop_node` pattern).
+fn spawn_subset_node(
+    carved: &Path,
+    all_experts: &[(u16, u16)],
+    keep: HashSet<(u16, u16)>,
+    done: Arc<AtomicBool>,
+) -> (SocketAddr, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let carved_p = carved.to_path_buf();
+    let drops: Vec<(u16, u16)> = all_experts
+        .iter()
+        .filter(|k| !keep.contains(k))
+        .copied()
+        .collect();
+    let handle = thread::spawn(move || {
+        let mut node = Node::load(&carved_p).unwrap();
+        for &(l, e) in &drops {
+            node.drop_expert(l, e);
+        }
+        for stream in listener.incoming() {
+            let sock = match stream {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            if done.load(Ordering::SeqCst) {
+                break;
+            }
+            sock.set_nodelay(true).unwrap();
+            let _ = node.serve_connection(sock);
+        }
+    });
+    (addr, handle)
+}
+
+/// Drive B streams through a `PlacedDispatch` over `node_count` localhost nodes,
+/// each holding only its map-assigned subset (drop the complement). Optionally
+/// make one node a BLACK HOLE (drains, never answers) to force the replica-set
+/// hedge onto the second replica. Returns tokens + stats.
+#[allow(clippy::too_many_arguments)]
+fn via_placed_batch(
+    spine: &Spine,
+    carved: &Path,
+    which: &str,
+    prompts: &[&[u32]],
+    tokens: usize,
+    map: PlacementMap,
+    node_count: usize,
+    all_experts: &[(u16, u16)],
+    hedge_delay: Option<Duration>,
+    blackhole: Option<usize>,
+) -> (Vec<Vec<u32>>, spine::GenStats) {
+    let manifest = Manifest::load(&carved.join(manifest::FILE_NAME)).unwrap();
+    let identity = *blake3::hash(&manifest.canonical_bytes()).as_bytes();
+    let hidden = manifest.model.hidden as usize;
+
+    let mut addrs = Vec::with_capacity(node_count);
+    let mut dones = Vec::with_capacity(node_count);
+    let mut handles = Vec::with_capacity(node_count);
+    for j in 0..node_count {
+        let done = Arc::new(AtomicBool::new(false));
+        let (addr, handle) = if blackhole == Some(j) {
+            spawn_blackhole(done.clone())
+        } else {
+            let keep: HashSet<(u16, u16)> = map.subset_for(j).into_iter().collect();
+            spawn_subset_node(carved, all_experts, keep, done.clone())
+        };
+        addrs.push(addr);
+        dones.push(done);
+        handles.push(handle);
+    }
+    let addr_strs: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
+
+    let mut disp = PlacedDispatch::connect(
+        &addr_strs,
+        || make_codec(which),
+        identity,
+        hidden,
+        map,
+        hedge_delay,
+    )
+    .unwrap();
+    let out = spine.generate_batch(&mut disp, prompts, tokens).unwrap();
+    drop(disp); // hang up every node connection
+
+    for done in &dones {
+        done.store(true, Ordering::SeqCst);
+    }
+    for addr in &addrs {
+        let _ = TcpStream::connect(addr); // wake each server's pending accept
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    out
+}
+
+/// THE M4 GATE: a placed fan-out over DISTINCT nodes reproduces `LocalDispatch`
+/// bit-for-bit. `r = 1` shards every routed expert onto exactly one of three
+/// nodes (distinct experts on distinct nodes — the thing M1–M3 never did), so
+/// this is genuine partition + reassembly, not a mirror. Full coverage → no
+/// renorm. Both codecs, B = 1 and B > 1.
+#[test]
+fn placed_equals_local_bit_exact() {
+    let root = tmp("placed-equiv");
+    let (model, carved) = fixture_and_carve(&root);
+    let manifest = Manifest::load(&carved.join(manifest::FILE_NAME)).unwrap();
+    let hidden = manifest.model.hidden as usize;
+    let spine = Spine::load(&model, &manifest, config(hidden, 2)).unwrap();
+    let all = all_expert_keys(&manifest);
+    let nodes = uniform_nodes(3);
+
+    let batches: [Vec<&[u32]>; 2] = [vec![&[1, 2, 3], &[3, 2, 1], &[2, 3, 1]], vec![&[1, 2, 3]]];
+    for prompts in &batches {
+        for which in ["fp8", "bf16"] {
+            let heat = bootstrap_heat(&all, &[]);
+            let map = build_placement(&nodes, &heat, 1).unwrap();
+            let (local, _) = via_local_batch(&spine, &carved, which, prompts, 6, &[]);
+            let (placed, pstats) =
+                via_placed_batch(&spine, &carved, which, prompts, 6, map, 3, &all, None, None);
+            assert_eq!(
+                local,
+                placed,
+                "codec {which} B={}: placed fan-out must reproduce the local path bit-for-bit",
+                prompts.len()
+            );
+            assert_eq!(
+                pstats.renorm_steps, 0,
+                "codec {which}: full r=1 coverage -> nothing renorms"
+            );
+            assert!(
+                pstats.wire_up > 0 && pstats.wire_down > 0,
+                "codec {which}: the fan-out crossed real sockets"
+            );
+        }
+    }
+}
+
+/// A placement HOLE — an expert no node holds — is the pre-existing not-held →
+/// renorm path (ADR-0024): the placed run renorms over exactly the same answered
+/// subset as a `LocalDispatch` that dropped that replica, bit-for-bit. `top_k =
+/// experts` routes the hole every step, so the renorm fires on every layer-0
+/// forward and nowhere else.
+#[test]
+fn placed_renorm_on_placement_hole() {
+    let root = tmp("placed-hole");
+    let (model, carved) = fixture_and_carve(&root);
+    let manifest = Manifest::load(&carved.join(manifest::FILE_NAME)).unwrap();
+    let hidden = manifest.model.hidden as usize;
+    let experts = manifest.model.experts_per_layer as usize;
+    let spine = Spine::load(&model, &manifest, config(hidden, experts)).unwrap();
+    let all = all_expert_keys(&manifest);
+    let nodes = uniform_nodes(2);
+    let hole = (0u16, 3u16); // routed every step, placed on no node
+    let prompts: Vec<&[u32]> = vec![&[1, 2, 3], &[3, 2, 1]];
+
+    for which in ["fp8", "bf16"] {
+        let heat = bootstrap_heat(&all, &[hole]);
+        let map = build_placement(&nodes, &heat, 1).unwrap();
+        assert!(
+            map.replicas_of(hole.0, hole.1).is_empty(),
+            "the hole must be genuinely unplaced"
+        );
+        let (local, _) = via_local_batch(&spine, &carved, which, &prompts, 6, &[hole]);
+        let (placed, pstats) = via_placed_batch(
+            &spine, &carved, which, &prompts, 6, map, 2, &all, None, None,
+        );
+        assert_eq!(
+            local, placed,
+            "codec {which}: a placement hole must renorm exactly like a dropped-replica local run"
+        );
+        assert!(
+            pstats.renorm_steps > 0,
+            "codec {which}: the unplaced expert must renorm"
+        );
+    }
+}
+
+/// REGRESSION LOCK: the replica-set hedge with NO loss is bit-for-bit the local
+/// path and NEVER fires. `r = 2` over two nodes replicates every expert on both;
+/// the primary (round 0) answers every layer within a generous hedge delay, so
+/// the second-send never runs and the tokens match `LocalDispatch` exactly.
+#[test]
+fn placed_hedge_equals_local_no_loss() {
+    let root = tmp("placed-hedge-noloss");
+    let (model, carved) = fixture_and_carve(&root);
+    let manifest = Manifest::load(&carved.join(manifest::FILE_NAME)).unwrap();
+    let hidden = manifest.model.hidden as usize;
+    let spine = Spine::load(&model, &manifest, config(hidden, 2)).unwrap();
+    let all = all_expert_keys(&manifest);
+    let nodes = uniform_nodes(2);
+    let hedge_delay = Duration::from_secs(5);
+
+    let batches: [Vec<&[u32]>; 2] = [vec![&[1, 2, 3], &[3, 2, 1], &[2, 3, 1]], vec![&[1, 2, 3]]];
+    for prompts in &batches {
+        for which in ["fp8", "bf16"] {
+            let heat = bootstrap_heat(&all, &[]);
+            let map = build_placement(&nodes, &heat, 2).unwrap();
+            let (local, _) = via_local_batch(&spine, &carved, which, prompts, 6, &[]);
+            let (placed, pstats) = via_placed_batch(
+                &spine,
+                &carved,
+                which,
+                prompts,
+                6,
+                map,
+                2,
+                &all,
+                Some(hedge_delay),
+                None,
+            );
+            assert_eq!(
+                local,
+                placed,
+                "codec {which} B={}: the no-loss hedged fan-out must equal the local path",
+                prompts.len()
+            );
+            assert_eq!(
+                pstats.hedges_fired,
+                0,
+                "codec {which} B={}: no loss -> the primary replica wins, no second-send",
+                prompts.len()
+            );
+        }
+    }
+}
+
+/// The FIRED replica-set hedge: the primary replica (node 0) is a black hole, so
+/// every expert's round-0 dispatch stalls and its round-1 replica (node 1)
+/// carries the answer — first-answer-wins — and the result is STILL bit-for-bit
+/// `LocalDispatch` (either replica's `y` is identical, ADR-0004 purity). The
+/// hedge fires once per layer-step and the second replica rescues everything, so
+/// nothing renorms.
+#[test]
+fn placed_hedge_fires_to_second_replica() {
+    let root = tmp("placed-hedge-fires");
+    let (model, carved) = fixture_and_carve(&root);
+    let manifest = Manifest::load(&carved.join(manifest::FILE_NAME)).unwrap();
+    let hidden = manifest.model.hidden as usize;
+    let moe_layers = manifest.model.moe_layers as u64;
+    let spine = Spine::load(&model, &manifest, config(hidden, 2)).unwrap();
+    let all = all_expert_keys(&manifest);
+    // A skewed pool so node 0 (the fat uplink) is deterministically the PRIMARY of
+    // EVERY expert — the placement engine preserves preference order (not node
+    // index), so a black-holed node 0 forces the hedge on every layer-step. node 1
+    // is every expert's second replica and holds them all.
+    let nodes = [
+        NodeDesc {
+            id: "fat0".into(),
+            failure_domain: "d0".into(),
+            uplink_class: 1_000_000,
+            ram_class: 1,
+        },
+        NodeDesc {
+            id: "thin1".into(),
+            failure_domain: "d1".into(),
+            uplink_class: 1,
+            ram_class: 1,
+        },
+    ];
+    let hedge_delay = Duration::from_millis(25); // paid once per layer (primary always stalls)
+    let tokens = 4usize;
+
+    let batches: [Vec<&[u32]>; 2] = [vec![&[1, 2, 3], &[3, 2, 1], &[2, 3, 1]], vec![&[1, 2, 3]]];
+    for prompts in &batches {
+        let forwards = (prompts[0].len() + tokens - 1) as u64;
+        let expected_hedges = forwards * moe_layers;
+        for which in ["fp8", "bf16"] {
+            // Weight-1 heat so the fat uplink wins the primary for every expert.
+            let mut heat = HeatMap::new();
+            for &(l, e) in &all {
+                heat.record_dispatch(l, e);
+            }
+            let map = build_placement(&nodes, &heat, 2).unwrap();
+            for &(l, e) in &all {
+                assert_eq!(
+                    map.replicas_of(l, e).first(),
+                    Some(&0),
+                    "node 0 (fat uplink) must be the primary of every expert"
+                );
+            }
+            let (local, _) = via_local_batch(&spine, &carved, which, prompts, tokens, &[]);
+            let (placed, pstats) = via_placed_batch(
+                &spine,
+                &carved,
+                which,
+                prompts,
+                tokens,
+                map,
+                2,
+                &all,
+                Some(hedge_delay),
+                Some(0), // node 0 (the primary replica) is the black hole
+            );
+            assert_eq!(
+                local,
+                placed,
+                "codec {which} B={}: the second-replica hedge must equal local bit-for-bit",
+                prompts.len()
+            );
+            assert_eq!(
+                pstats.hedges_fired,
+                expected_hedges,
+                "codec {which} B={}: the black-holed primary must hedge every layer-step",
+                prompts.len()
+            );
+            assert_eq!(
+                pstats.renorm_steps,
+                0,
+                "codec {which} B={}: the second replica rescues every expert — no renorm",
+                prompts.len()
+            );
+        }
+    }
+}
+
 /// The literal "two real processes over localhost" gate: spawn `kenny node`,
 /// read its OS-assigned address off stdout, then run `kenny spine` against it.
 #[test]
@@ -934,6 +1304,106 @@ fn two_process_cli_smoke() {
     assert!(
         stdout.contains("wire:"),
         "stats missing wire bytes:\n{stdout}"
+    );
+}
+
+/// The multi-node CLI hook: `kenny spine --node a --node b` no longer rejects a
+/// second `--node` (that was the M1 `nodes.len() > 1` gate) but builds a placed
+/// dispatch over both. Two real `kenny node` processes serve; the spine fans the
+/// routed experts across them per the ADR-0009 bootstrap placement and reports
+/// the placed topology. `--hedge-ms` is passed too, so this also asserts the
+/// ADR-0010 replica-set hedge is ARMABLE from the product path (an unwired flag
+/// would fail as an unexpected argument); with a healthy pool the primary wins
+/// and no hedge fires. Proves the end-to-end multi-node path runs on the existing
+/// wire.
+#[test]
+fn multi_node_placed_cli_smoke() {
+    let root = tmp("cli-placed");
+    let (model, carved) = fixture_and_carve(&root);
+    let manifest = Manifest::load(&carved.join(manifest::FILE_NAME)).unwrap();
+    let hidden = manifest.model.hidden as usize;
+    let bin = env!("CARGO_BIN_EXE_kenny");
+
+    // Spawn two nodes; read each OS-assigned address off its stdout.
+    let mut procs = Vec::new();
+    let mut addrs = Vec::new();
+    for _ in 0..2 {
+        let mut node = Command::new(bin)
+            .args([
+                "node",
+                "--carved",
+                carved.to_str().unwrap(),
+                "--listen",
+                "127.0.0.1:0",
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut reader = BufReader::new(node.stdout.take().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let addr = line
+            .trim()
+            .strip_prefix("listening ")
+            .expect("node must print 'listening <addr>' on stdout")
+            .to_string();
+        procs.push(node);
+        addrs.push(addr);
+    }
+
+    let out = Command::new(bin)
+        .args([
+            "spine",
+            "--carved",
+            carved.to_str().unwrap(),
+            "--model",
+            model.to_str().unwrap(),
+            "--node",
+            &addrs[0],
+            "--node",
+            &addrs[1],
+            "--replicas",
+            "2",
+            "--hedge-ms",
+            "500",
+            "--tokens",
+            "3",
+            "--batch",
+            "2",
+            "--codec",
+            "fp8",
+            "--num-heads",
+            "1",
+            "--num-kv-heads",
+            "1",
+            "--head-dim",
+            &hidden.to_string(),
+            "--top-k",
+            "2",
+            "--rope-theta",
+            "1000000",
+            "--rms-eps-ppm",
+            "1",
+        ])
+        .output()
+        .unwrap();
+
+    for mut node in procs {
+        let _ = node.kill();
+        let _ = node.wait();
+    }
+
+    assert!(
+        out.status.success(),
+        "kenny spine (multi-node) failed: {}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("tok/s"), "stats missing tok/s:\n{stdout}");
+    assert!(
+        stdout.contains("2 nodes placed"),
+        "multi-node run must report the placed topology:\n{stdout}"
     );
 }
 
