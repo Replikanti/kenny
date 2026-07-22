@@ -12,7 +12,7 @@
 # second-box LAN — the real-LAN validation stays issue #4.
 #
 # Usage:
-#   tools/netem-bench.sh [--rtt MS] [--loss PCT] [--jitter MS] [--loss-hol]
+#   tools/netem-bench.sh [--rtt MS] [--loss PCT] [--jitter MS] [--loss-hol] [--hedge]
 #
 # Fixture arm (model-free, ~10 min): amortization B-sweep at the given RTT.
 #   tools/netem-bench.sh --rtt 30
@@ -23,6 +23,9 @@
 # Loss / head-of-line (HOL) matrix (model-free): the per-layer timeout OFF vs ON
 # under a loss sweep L in {0, 0.5, 1, 2}%, one netem qdisc + test run per L.
 #   tools/netem-bench.sh --rtt 30 --loss-hol
+# Tail-latency hedge (model-free): the hedge OFF vs ON at a fixed loss (1% by
+# default) — the ADR-0010 hedge-rate-vs-p99 number.
+#   tools/netem-bench.sh --rtt 30 --hedge
 #
 # If unprivileged netns is unavailable (e.g. CI), prints a skip and exits 0 — a
 # plain `cargo test` never touches netem (the Rust arm is KENNY_NETEM_RTT_MS-gated).
@@ -32,6 +35,7 @@ rtt=30
 loss=
 jitter=
 loss_hol=
+hedge=
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -39,7 +43,8 @@ while [ $# -gt 0 ]; do
     --loss) loss=$2; shift 2 ;;
     --jitter) jitter=$2; shift 2 ;;
     --loss-hol) loss_hol=1; shift ;;
-    -h|--help) sed -n '2,29p' "$0"; exit 0 ;;
+    --hedge) hedge=1; shift ;;
+    -h|--help) sed -n '2,32p' "$0"; exit 0 ;;
     *) echo "netem-bench: unknown argument '$1'" >&2; exit 2 ;;
   esac
 done
@@ -85,7 +90,11 @@ run_one() {
   '
 }
 
-if [ -n "$loss_hol" ]; then
+if [ -n "$hedge" ]; then
+  # Tail-latency hedge: one netem qdisc + netem_hedge run at a fixed loss (1% by
+  # default) — the test contrasts the hedge OFF vs ON at a fixed B.
+  run_one "$rtt" netem_hedge "${loss:-1}"
+elif [ -n "$loss_hol" ]; then
   # Loss / HOL matrix: one netem qdisc + netem_loss_hol run per loss value; the
   # test sweeps B in {16,64} and the per-layer timeout OFF/ON at each L.
   for L in 0 0.5 1 2; do
