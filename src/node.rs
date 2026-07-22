@@ -257,13 +257,24 @@ pub fn serve(carved_dir: &Path, listen: &str) -> Result<()> {
 
     for stream in listener.incoming() {
         match stream {
-            Ok(sock) => match node.serve_connection(sock) {
-                Ok(s) => eprintln!(
-                    "node: session served {} dispatches ({} ok, {} not-held, in {} B, out {} B)",
-                    s.dispatches, s.experts_ok, s.experts_not_held, s.bytes_in, s.bytes_out
-                ),
-                Err(e) => eprintln!("node: session error: {e}"),
-            },
+            Ok(sock) => {
+                // TCP_NODELAY on the accepted socket: mirrors
+                // `NodeDispatch::connect` so the node's own back-to-back gather
+                // writes (composed-wire batch pipeline, ADR-0023) don't stall
+                // behind Nagle either. A per-socket hint, no wire-byte change —
+                // still ADR-0016 option (a) sync TCP. Best-effort: a hint
+                // failure on a live socket is not a reason to refuse service.
+                if let Err(e) = sock.set_nodelay(true) {
+                    eprintln!("node: warning: cannot set TCP_NODELAY on accepted socket: {e}");
+                }
+                match node.serve_connection(sock) {
+                    Ok(s) => eprintln!(
+                        "node: session served {} dispatches ({} ok, {} not-held, in {} B, out {} B)",
+                        s.dispatches, s.experts_ok, s.experts_not_held, s.bytes_in, s.bytes_out
+                    ),
+                    Err(e) => eprintln!("node: session error: {e}"),
+                }
+            }
             Err(e) => eprintln!("node: accept failed: {e}"),
         }
     }
