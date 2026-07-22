@@ -29,6 +29,9 @@ fits a dev machine for cheap end-to-end validation with reference outputs.
 - GLM-specific machinery absent from Qwen3 — shared expert (fires every token →
   spine), DSA sparse attention, MTP layer — must be carried in the design even
   though dev runs never exercise it. Checklist lives with the spine milestones.
+  The shared expert's placement × renorm × failure semantics are decided in
+  ADR-0025 (proposed, numerics confirmed at M5.C); DSA and MTP remain untested
+  scaffolding until the real card and get their own treatment.
 - Model releases move; MANIFESTO §4.2 numbers are re-verified against the actual
   checkpoint before each milestone that consumes them.
 
