@@ -378,6 +378,13 @@ pub trait Dispatcher {
     fn layer_timeouts(&self) -> u64 {
         0
     }
+
+    /// Times the redundant secondary was fired for a stalled layer over this
+    /// dispatcher's life (ADR-0010 hedge); `0` for dispatchers without a hedge.
+    /// Read into `GenStats` at the end of a run, like `layer_timeouts`.
+    fn hedges_fired(&self) -> u64 {
+        0
+    }
 }
 
 /// In-process dispatch: runs experts through a `Node` loaded from the carve,
@@ -581,6 +588,40 @@ impl NodeDispatch {
         }
         Ok(out)
     }
+
+    /// Send one dispatch frame (encode `x` with this connection's codec). A thin
+    /// shared helper for `HedgedDispatch`, which drives two `NodeDispatch`
+    /// connections directly; the single/batch paths above stay byte-for-byte as
+    /// they were (their wire goldens depend on it).
+    fn send_one(&mut self, layer: u16, x: &[f32], experts: &[u16]) -> Result<()> {
+        let mut xb = Vec::with_capacity(self.elem_len);
+        self.codec.encode(x, &mut xb);
+        self.transport.send_dispatch(&Dispatch {
+            layer,
+            x: xb,
+            experts: experts.to_vec(),
+        })
+    }
+
+    /// Arm this connection's receive deadline for the next gather(s).
+    fn set_read_deadline(&self, deadline: Duration) {
+        let _ = self.transport.get_ref().set_read_timeout(Some(deadline));
+    }
+
+    /// Receive one gather under the currently-armed deadline, decoded against
+    /// `experts`. `Ok(None)` on a read timeout (the caller decides whether to
+    /// hedge or renorm); `Ok(Some(..))` on an answer.
+    fn recv_gather_opt(&mut self, experts: &[u16]) -> Result<Option<Vec<Option<Vec<f32>>>>> {
+        match self.transport.recv_gather(self.elem_len) {
+            Ok(gather) => Ok(Some(Self::decode_gather(
+                self.codec.as_ref(),
+                experts,
+                &gather,
+            )?)),
+            Err(e) if e.is_timeout() => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 impl NodeDispatch {
@@ -740,6 +781,154 @@ impl Dispatcher for NodeDispatch {
     }
 }
 
+/// Secondary read budget once a hedge fires = `hedge_delay × this`. A healthy
+/// redundant gather returns in ~one RTT, so a few × the hedge delay clears it;
+/// only a rare double packet loss trips it (see `HedgedDispatch::connect`).
+const HEDGE_BUDGET_MULT: u32 = 6;
+
+/// Tail-latency hedged dispatch (ADR-0010): TWO `NodeDispatch` connections to a
+/// pair of nodes that BOTH hold every requested expert. Each layer is dispatched
+/// on the primary first; if the primary does not answer within `hedge_delay`, the
+/// redundant secondary is fired for the stalled streams and the first answer wins
+/// — collapsing the per-step p99 that a single connection pays as a full TCP RTO
+/// when a gather segment is lost. Experts are pure functions (ADR-0004), so the
+/// duplicate run is safe and either node's `y` is bit-identical; with no loss the
+/// primary always wins and the path reduces exactly to `NodeDispatch`.
+///
+/// This is a FIXTURE measurement vehicle: both connections hold the whole expert
+/// set (real ADR-0009 replica placement is out of scope, issue #4). No wire change
+/// — two ordinary `NodeDispatch` connections, so `WIRE_VERSION`/codecs/goldens are
+/// untouched.
+pub struct HedgedDispatch {
+    primary: NodeDispatch,
+    secondary: NodeDispatch,
+    /// How long the primary is given before the redundant secondary is fired.
+    hedge_delay: Duration,
+    /// Secondary read deadline once the hedge fires (bounds p99; a rare double
+    /// miss trips it, dropping those streams to `NotHeld` → the ADR-0008 renorm).
+    hedge_budget: Duration,
+    /// Times the secondary was fired for a stalled layer over this run.
+    hedges_fired: u64,
+}
+
+impl HedgedDispatch {
+    /// Connect the primary + secondary node pair (both hold every expert) and set
+    /// the hedge delay. `hedge_delay` is clamped to at least 1 ms because a zero
+    /// receive timeout means "block forever" on the socket; an ~immediate ("hot")
+    /// hedge is the 1 ms limit of this knob.
+    pub fn connect(
+        primary_addr: &str,
+        secondary_addr: &str,
+        codec_primary: Box<dyn WireCodec>,
+        codec_secondary: Box<dyn WireCodec>,
+        identity: [u8; 32],
+        hidden: usize,
+        hedge_delay: Duration,
+    ) -> Result<HedgedDispatch> {
+        let primary = NodeDispatch::connect(primary_addr, codec_primary, identity, hidden)?;
+        let secondary = NodeDispatch::connect(secondary_addr, codec_secondary, identity, hidden)?;
+        let hedge_delay = hedge_delay.max(Duration::from_millis(1));
+        let hedge_budget = hedge_delay
+            .checked_mul(HEDGE_BUDGET_MULT)
+            .unwrap_or(hedge_delay);
+        Ok(HedgedDispatch {
+            primary,
+            secondary,
+            hedge_delay,
+            hedge_budget,
+            hedges_fired: 0,
+        })
+    }
+}
+
+impl Dispatcher for HedgedDispatch {
+    fn dispatch(
+        &mut self,
+        layer: u16,
+        x: &[f32],
+        experts: &[u16],
+    ) -> Result<Vec<Option<Vec<f32>>>> {
+        // Single-stream is the width-1 batch — one hedge path, no duplication.
+        let items: [(&[f32], &[u16]); 1] = [(x, experts)];
+        let mut out = self.dispatch_batch(layer, &items)?;
+        Ok(out.pop().expect("one item -> one result"))
+    }
+
+    /// Send every stream on the primary, then read within the hedge delay. On the
+    /// first stalled stream the whole tail is head-of-line-blocked behind it on
+    /// that one connection, so the redundant secondary is fired for the stalled
+    /// tail `[start..B]` (first-answer-wins). The stalled primary is then
+    /// abandoned (reconnected) so it resyncs past its in-flight gathers; a rare
+    /// double miss on the secondary drops those streams to `NotHeld` (renorm). The
+    /// fixture frames are tiny, so send-all-then-read is deadlock-free here.
+    fn dispatch_batch(
+        &mut self,
+        layer: u16,
+        items: &[(&[f32], &[u16])],
+    ) -> Result<Vec<Vec<Option<Vec<f32>>>>> {
+        for &(x, experts) in items {
+            self.primary.send_one(layer, x, experts)?;
+        }
+        self.primary.set_read_deadline(self.hedge_delay);
+        let mut out: Vec<Vec<Option<Vec<f32>>>> = Vec::with_capacity(items.len());
+        let mut stalled_at = None;
+        for (i, &(_x, experts)) in items.iter().enumerate() {
+            match self.primary.recv_gather_opt(experts)? {
+                Some(ys) => out.push(ys),
+                None => {
+                    stalled_at = Some(i);
+                    break;
+                }
+            }
+        }
+        let Some(start) = stalled_at else {
+            // Primary answered the whole batch within the hedge delay — the
+            // no-loss common case, bit-for-bit the plain node path.
+            return Ok(out);
+        };
+
+        // Hedge: re-dispatch the stalled tail on the secondary (ADR-0004 purity
+        // makes the duplicate run safe) and take its answers.
+        self.hedges_fired += 1;
+        for &(x, experts) in &items[start..] {
+            self.secondary.send_one(layer, x, experts)?;
+        }
+        self.secondary.set_read_deadline(self.hedge_budget);
+        let mut sec_stalled_at = None;
+        for (j, &(_x, experts)) in items[start..].iter().enumerate() {
+            match self.secondary.recv_gather_opt(experts)? {
+                Some(ys) => out.push(ys),
+                None => {
+                    sec_stalled_at = Some(start + j);
+                    break;
+                }
+            }
+        }
+
+        // The primary's stalled tail is still in flight; abandon that connection.
+        self.primary.reconnect()?;
+        if let Some(k) = sec_stalled_at {
+            // Double miss: the secondary also stalled, so it is desynced too and
+            // the remaining streams renorm over an empty answered set (NotHeld).
+            self.secondary.reconnect()?;
+            for &(_x, experts) in &items[k..] {
+                out.push(vec![None; experts.len()]);
+            }
+        }
+        Ok(out)
+    }
+
+    fn wire_bytes(&self) -> (u64, u64) {
+        let (pu, pd) = self.primary.wire_bytes();
+        let (su, sd) = self.secondary.wire_bytes();
+        (pu + su, pd + sd)
+    }
+
+    fn hedges_fired(&self) -> u64 {
+        self.hedges_fired
+    }
+}
+
 // -------------------------------------------------------------------------
 // The spine forward
 // -------------------------------------------------------------------------
@@ -774,6 +963,10 @@ pub struct GenStats {
     /// straggler count behind the timeout RATE BENCH reports. `0` unless a
     /// `NodeDispatch::with_layer_timeout` deadline was set.
     pub layer_timeouts: u64,
+    /// Layers on which the redundant secondary was fired (ADR-0010 hedge) over the
+    /// run — the numerator of the hedge RATE BENCH reports. `0` unless a
+    /// `HedgedDispatch` drove the run.
+    pub hedges_fired: u64,
     pub wire_up: u64,
     pub wire_down: u64,
     pub elapsed: Duration,
@@ -938,6 +1131,7 @@ impl Spine {
         stats.wire_up = up;
         stats.wire_down = down;
         stats.layer_timeouts = dispatcher.layer_timeouts();
+        stats.hedges_fired = dispatcher.hedges_fired();
         Ok((tokens, stats))
     }
 

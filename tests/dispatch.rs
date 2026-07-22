@@ -11,8 +11,8 @@
 //! in `src/spine.rs`. The real-model two-process run is `KENNY_MODEL_DIR`-gated
 //! and lives in a later PR (S7).
 
-use std::io::{BufRead, BufReader};
-use std::net::{TcpListener, TcpStream};
+use std::io::{BufRead, BufReader, Read};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -25,7 +25,9 @@ use kenny::carve::{self, Options};
 use kenny::fixture::{self, Params};
 use kenny::manifest::{self, Manifest};
 use kenny::node::Node;
-use kenny::spine::{self, Config, LocalDispatch, NodeDispatch, Spine, eps_from_ppm};
+use kenny::spine::{
+    self, Config, HedgedDispatch, LocalDispatch, NodeDispatch, Spine, eps_from_ppm,
+};
 use kenny::wire::{
     Bf16Codec, DISPATCH_HEADER_LEN, Fp8Codec, GATHER_HEADER_LEN, GATHER_RECORD_HEADER_LEN,
     HANDSHAKE_LEN, WireCodec,
@@ -205,6 +207,155 @@ fn via_node_batch_timed(
     done.store(true, Ordering::SeqCst);
     let _ = TcpStream::connect(addr); // wake the server's pending accept so it exits
     server.join().unwrap();
+    out
+}
+
+/// Spawn a node that serves connections in a LOOP (one stateless `Node` per the
+/// whole run), so a `HedgedDispatch` reconnect after a stalled/abandoned layer is
+/// re-accepted. Returns the bound address and the server handle; the loop exits
+/// once `done` is set and a wake connection unblocks the pending `accept`.
+fn spawn_loop_node(carved: &Path, done: Arc<AtomicBool>) -> (SocketAddr, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let carved_p = carved.to_path_buf();
+    let handle = thread::spawn(move || {
+        let mut node = Node::load(&carved_p).unwrap();
+        for stream in listener.incoming() {
+            let sock = match stream {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            if done.load(Ordering::SeqCst) {
+                break; // the wake connection after the run finished
+            }
+            sock.set_nodelay(true).unwrap();
+            // A reset mid-gather on a hedge abandon/reconnect is expected, so the
+            // per-connection result is ignored and the loop accepts the next.
+            let _ = node.serve_connection(sock);
+        }
+    });
+    (addr, handle)
+}
+
+/// Hedged twin of `via_node_batch`: TWO nodes (both hold every expert), driven by
+/// a `HedgedDispatch` with the given hedge delay. Each node serves in a loop
+/// (`spawn_loop_node`) because a fired hedge abandons + reconnects the stalled
+/// connection. With no loss the primary always wins and this reduces to the plain
+/// single-node path, bit-for-bit.
+fn via_two_node_batch_hedged(
+    spine: &Spine,
+    carved: &Path,
+    which: &str,
+    prompts: &[&[u32]],
+    tokens: usize,
+    hedge_delay: Duration,
+) -> (Vec<Vec<u32>>, spine::GenStats) {
+    let manifest = Manifest::load(&carved.join(manifest::FILE_NAME)).unwrap();
+    let identity = *blake3::hash(&manifest.canonical_bytes()).as_bytes();
+    let hidden = manifest.model.hidden as usize;
+    let done_a = Arc::new(AtomicBool::new(false));
+    let done_b = Arc::new(AtomicBool::new(false));
+    let (addr_a, srv_a) = spawn_loop_node(carved, done_a.clone());
+    let (addr_b, srv_b) = spawn_loop_node(carved, done_b.clone());
+
+    let mut dispatch = HedgedDispatch::connect(
+        &addr_a.to_string(),
+        &addr_b.to_string(),
+        make_codec(which),
+        make_codec(which),
+        identity,
+        hidden,
+        hedge_delay,
+    )
+    .unwrap();
+    let out = spine
+        .generate_batch(&mut dispatch, prompts, tokens)
+        .unwrap();
+    drop(dispatch); // hang up both connections
+
+    done_a.store(true, Ordering::SeqCst);
+    done_b.store(true, Ordering::SeqCst);
+    let _ = TcpStream::connect(addr_a); // wake each server's pending accept
+    let _ = TcpStream::connect(addr_b);
+    srv_a.join().unwrap();
+    srv_b.join().unwrap();
+    out
+}
+
+/// Spawn a BLACK-HOLE node: it accepts connections (in a loop, for reconnects)
+/// and drains everything the spine sends, but NEVER answers — so a `HedgedDispatch`
+/// primary pointed here times out on every layer and the hedge fires every time.
+/// The drain keeps the spine's writes from ever blocking on a full send buffer.
+fn spawn_blackhole(done: Arc<AtomicBool>) -> (SocketAddr, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut sock = match stream {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            if done.load(Ordering::SeqCst) {
+                break; // the wake connection after the run finished
+            }
+            sock.set_nodelay(true).ok();
+            let mut buf = [0u8; 4096];
+            // Drain until the spine hangs up (drop or a hedge reconnect), then
+            // loop back to accept the next (re)connection. Never write a reply.
+            loop {
+                match sock.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        }
+    });
+    (addr, handle)
+}
+
+/// Fired-hedge harness: the PRIMARY is a black hole (never answers) and the
+/// SECONDARY is a real node holding every expert, so the hedge fires on every
+/// layer and the secondary carries the whole run. Returns the tokens + stats so a
+/// test can assert the hedge fired AND the result is still bit-exact (the secondary
+/// runs the same pure experts). `hedge_delay` is paid once per layer here (the
+/// primary always stalls), so keep it short.
+fn via_blackhole_primary_hedged(
+    spine: &Spine,
+    carved: &Path,
+    which: &str,
+    prompts: &[&[u32]],
+    tokens: usize,
+    hedge_delay: Duration,
+) -> (Vec<Vec<u32>>, spine::GenStats) {
+    let manifest = Manifest::load(&carved.join(manifest::FILE_NAME)).unwrap();
+    let identity = *blake3::hash(&manifest.canonical_bytes()).as_bytes();
+    let hidden = manifest.model.hidden as usize;
+    let done_bh = Arc::new(AtomicBool::new(false));
+    let done_sec = Arc::new(AtomicBool::new(false));
+    let (bh_addr, bh_srv) = spawn_blackhole(done_bh.clone());
+    let (sec_addr, sec_srv) = spawn_loop_node(carved, done_sec.clone());
+
+    let mut dispatch = HedgedDispatch::connect(
+        &bh_addr.to_string(),
+        &sec_addr.to_string(),
+        make_codec(which),
+        make_codec(which),
+        identity,
+        hidden,
+        hedge_delay,
+    )
+    .unwrap();
+    let out = spine
+        .generate_batch(&mut dispatch, prompts, tokens)
+        .unwrap();
+    drop(dispatch);
+
+    done_bh.store(true, Ordering::SeqCst);
+    done_sec.store(true, Ordering::SeqCst);
+    let _ = TcpStream::connect(bh_addr);
+    let _ = TcpStream::connect(sec_addr);
+    bh_srv.join().unwrap();
+    sec_srv.join().unwrap();
     out
 }
 
@@ -607,6 +758,102 @@ fn timeout_disabled_equals_node() {
             (to_stats.wire_up, to_stats.wire_down),
             "codec {which}: identical wire bytes (no reconnect, no re-handshake)"
         );
+    }
+}
+
+/// REGRESSION LOCK (CI-runnable, no netns): a `HedgedDispatch` with NO induced
+/// loss must be bit-for-bit the plain in-process path — first-answer-wins over two
+/// nodes that hold identical (pure, ADR-0004) experts yields the identical `y`, so
+/// the tokens match `LocalDispatch` exactly and the hedge NEVER fires (the primary
+/// wins every layer at RTT≈0). This guards that adding the second connection + the
+/// hedge/abandon plumbing did not perturb the numeric path. The p99-collapse
+/// behavior under loss needs the netns and lives in `netem_hedge`. A generous
+/// hedge delay keeps `hedges_fired == 0` robust to CI scheduler jitter.
+#[test]
+fn hedge_equals_local_no_loss() {
+    let root = tmp("hedge-noloss");
+    let (model, carved) = fixture_and_carve(&root);
+    let manifest = Manifest::load(&carved.join(manifest::FILE_NAME)).unwrap();
+    let hidden = manifest.model.hidden as usize;
+    let spine = Spine::load(&model, &manifest, config(hidden, 2)).unwrap();
+    let hedge_delay = Duration::from_secs(5);
+
+    // Batched (B > 1) and single-stream (B = 1) both reduce to the local path.
+    let batches: [Vec<&[u32]>; 2] = [vec![&[1, 2, 3], &[3, 2, 1], &[2, 3, 1]], vec![&[1, 2, 3]]];
+    for prompts in &batches {
+        for which in ["fp8", "bf16"] {
+            let (local, _) = via_local_batch(&spine, &carved, which, prompts, 6, &[]);
+            let (hedged, hstats) =
+                via_two_node_batch_hedged(&spine, &carved, which, prompts, 6, hedge_delay);
+            assert_eq!(
+                local,
+                hedged,
+                "codec {which} B={}: hedged first-answer-wins must equal the local path bit-for-bit",
+                prompts.len()
+            );
+            assert_eq!(
+                hstats.hedges_fired,
+                0,
+                "codec {which} B={}: no loss -> no hedge fires",
+                prompts.len()
+            );
+            // The redundant secondary is real wire (its handshake at least), so the
+            // hedge pair moved more bytes than a single connection would.
+            assert!(hstats.wire_up > 0 && hstats.wire_down > 0, "wire moved");
+        }
+    }
+}
+
+/// REGRESSION LOCK (CI-runnable, no netns): the FIRED-hedge path. The primary is a
+/// black hole (accepts + drains but never answers), so the hedge fires on EVERY
+/// layer and the real secondary carries the whole run — and the result is STILL
+/// bit-for-bit `LocalDispatch`, because both would-be answers come from the same
+/// pure experts (ADR-0004). This is the CI cover for the branch `netem_hedge`
+/// exercises but cannot assert on (it emits numbers, not pass/fail), and the
+/// complement of `hedge_equals_local_no_loss` (which locks the NEVER-fired path).
+#[test]
+fn hedge_fires_and_stays_bit_exact() {
+    let root = tmp("hedge-fires");
+    let (model, carved) = fixture_and_carve(&root);
+    let manifest = Manifest::load(&carved.join(manifest::FILE_NAME)).unwrap();
+    let hidden = manifest.model.hidden as usize;
+    let moe_layers = manifest.model.moe_layers as u64;
+    let spine = Spine::load(&model, &manifest, config(hidden, 2)).unwrap();
+    // Short: the primary always stalls, so the hedge delay is paid once per layer.
+    let hedge_delay = Duration::from_millis(25);
+    let tokens = 6usize;
+
+    // Both B > 1 and B = 1 (the width-1 batch is the `dispatch` single path).
+    let batches: [Vec<&[u32]>; 2] = [vec![&[1, 2, 3], &[3, 2, 1], &[2, 3, 1]], vec![&[1, 2, 3]]];
+    for prompts in &batches {
+        // forwards/stream = prompt_len primes + (tokens - 1) generations; the hedge
+        // fires once per dispatch_batch = once per (forward × MoE layer).
+        let forwards = (prompts[0].len() + tokens - 1) as u64;
+        let expected_hedges = forwards * moe_layers;
+        for which in ["fp8", "bf16"] {
+            let (local, _) = via_local_batch(&spine, &carved, which, prompts, tokens, &[]);
+            let (hedged, hstats) =
+                via_blackhole_primary_hedged(&spine, &carved, which, prompts, tokens, hedge_delay);
+            assert_eq!(
+                local,
+                hedged,
+                "codec {which} B={}: fired-hedge (secondary-carried) must equal local bit-for-bit",
+                prompts.len()
+            );
+            assert_eq!(
+                hstats.hedges_fired,
+                expected_hedges,
+                "codec {which} B={}: the black-holed primary must fire the hedge every layer-step",
+                prompts.len()
+            );
+            // The secondary answered every stalled stream, so nothing renormed.
+            assert_eq!(
+                hstats.renorm_steps,
+                0,
+                "codec {which} B={}: the secondary rescues every stall — no NotHeld/renorm",
+                prompts.len()
+            );
+        }
     }
 }
 
@@ -1278,4 +1525,115 @@ fn netem_loss_hol() {
             );
         }
     }
+}
+
+// -------------------------------------------------------------------------
+// M3 — tail-latency hedge (ADR-0010): hedge rate vs p99. The 48-layer compute≈0
+// fixture over TWO nodes (both hold every expert), at the qdisc's loss, with the
+// hedge OFF (a single connection, no redundancy) vs ON (`HedgedDispatch`),
+// reporting per-step median/p99 + the hedge rate. netns-gated exactly like
+// netem_amortization; run by `tools/netem-bench.sh --hedge` (loss 1% by default).
+// This is the ADR-0010 number: does firing a redundant secondary on a stalled
+// layer collapse the per-step p99 a single connection pays as a full TCP RTO?
+// -------------------------------------------------------------------------
+
+#[test]
+fn netem_hedge() {
+    let Some(rtt_os) = std::env::var_os("KENNY_NETEM_RTT_MS") else {
+        eprintln!(
+            "KENNY_NETEM_RTT_MS unset — skipping M3 netem hedge \
+             (run via tools/netem-bench.sh --hedge)"
+        );
+        return;
+    };
+    let rtt_ms: u64 = rtt_os
+        .to_string_lossy()
+        .parse()
+        .expect("KENNY_NETEM_RTT_MS must be an integer number of milliseconds");
+    let loss_pct = std::env::var("KENNY_NETEM_LOSS_PCT").unwrap_or_else(|_| "0".into());
+
+    let root = tmp("netem-hedge");
+    // Same 48-barrier compute≈0 fixture as netem_amortization / netem_loss_hol.
+    let params = Params {
+        layers: 48,
+        experts: 8,
+        hidden: 8,
+        inter: 4,
+        vocab: 32,
+        seed: 42,
+    };
+    let model = root.join("model");
+    fixture::generate(&params, &model).unwrap();
+    let carved = root.join("carved");
+    carve::run(
+        &model,
+        &Options {
+            out: carved.clone(),
+            model_name: "netem-fixture".into(),
+            model_rev: String::new(),
+            dtype: Dtype::Fp8,
+        },
+    )
+    .unwrap();
+
+    let manifest = Manifest::load(&carved.join(manifest::FILE_NAME)).unwrap();
+    let hidden = manifest.model.hidden as usize;
+    let moe_layers = manifest.model.moe_layers as u64;
+    let spine = Spine::load(&model, &manifest, config(hidden, 2)).unwrap();
+
+    let prompt_len = 2usize;
+    // 30 steps → a ~31-sample tail; with the hedge OFF a lost gather adds a full
+    // TCP RTO to the step, so the wall-clock is bounded but the p99 is not. HONEST
+    // CAVEAT: at n ≈ 31 the nearest-rank p99 is the MAX sample (rank = ceil(0.99·n)
+    // − 1 = n − 1 for n ≤ 100), so read "p99" here as "worst of ~31 steps", not a
+    // populated tail — contrast netem_amortization's ~101 steps. Loss inflates the
+    // per-step time (off median ~3.5 s), so 101 steps here would cost ~10 min/mode;
+    // the coarse worst-of-31 is the deliberate wall-clock trade for the hedge point.
+    let steps = 30usize;
+    let n_samples = prompt_len + steps - 1; // per_forward samples the p99 is over
+    let vocab = spine.vocab();
+    // Hedge delay = 2× the loss-free RTT: a healthy primary gather (~RTT) beats it,
+    // so the hedge fires only on a stalled (lost/retransmitting) layer, not on
+    // ordinary jitter. The secondary then answers in ~one more RTT.
+    let hedge_delay = Duration::from_millis((rtt_ms * 2).max(1));
+    // Fixed B (the plan's hedge point); 16 is enough independent streams for a
+    // stall to be probable at 1% loss without inflating the wall-clock.
+    let b = 16usize;
+
+    eprintln!(
+        "M3 hedge: {moe_layers} MoE layers, RTT {rtt_ms} ms, loss {loss_pct}%, \
+         hedge delay {} ms, B {b}, {steps} steps, fp8 wire, netem loopback",
+        hedge_delay.as_millis()
+    );
+    eprintln!(
+        "  NOTE: step_p99 is nearest-rank over n={n_samples} samples \
+         (n≤100 ⇒ p99 = the MAX step, i.e. worst-of-{n_samples}, NOT a populated tail)"
+    );
+    eprintln!("mode\tstep_median\tstep_p99\thedges_fired\thedge_rate\trenorm_steps");
+
+    let prompts = bench_prompts(b, prompt_len, vocab, 42);
+    let refs: Vec<&[u32]> = prompts.iter().map(Vec::as_slice).collect();
+
+    // Hedge OFF: a single connection, no redundancy — the tail a lone node pays.
+    let (_o, off) = via_node_batch(&spine, &carved, "fp8", &refs, steps, &[]);
+    let (off_med, off_p99) = off.latency_median_p99();
+    eprintln!(
+        "off\t{off_med:.2?}\t{off_p99:.2?}\t-\t-\t{}",
+        off.renorm_steps
+    );
+
+    // Hedge ON: two nodes + a redundant secondary on a stalled layer.
+    let (_o, on) = via_two_node_batch_hedged(&spine, &carved, "fp8", &refs, steps, hedge_delay);
+    let (on_med, on_p99) = on.latency_median_p99();
+    // One dispatch_batch per MoE layer per batched step is the hedge denominator.
+    let layer_steps = on.per_forward.len() as u64 * moe_layers;
+    let rate = if layer_steps > 0 {
+        on.hedges_fired as f64 / layer_steps as f64
+    } else {
+        0.0
+    };
+    eprintln!(
+        "on\t{on_med:.2?}\t{on_p99:.2?}\t{}\t{rate:.4}\t{}",
+        on.hedges_fired, on.renorm_steps
+    );
 }
