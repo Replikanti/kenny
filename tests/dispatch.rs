@@ -1689,6 +1689,417 @@ fn placed_replace_leave_creates_hole_and_renorms() {
     }
 }
 
+// -------------------------------------------------------------------------
+// M5.A — CORRELATED CHURN (ADR-0008 / ADR-0009). Elasticity's failure case: a
+// whole failure DOMAIN dies together (a household/ISP/rack, MANIFESTO §5), not one
+// random node. The in-process analogue keeps the placement map pointing at the
+// dead domain's node indices (the down-window BEFORE an operator re-places) but
+// makes those nodes BLACK HOLES — they answer TCP but never a gather, the
+// "process wedged / link gone" correlated failure. The replica-set budget
+// (`hedge_delay`) is what makes a silent node fail GRACEFULLY: its share stalls
+// out (`PlacedDispatch::stall_node` reconnects the desynced connection) instead of
+// blocking the step forever, so the ADR-0008 renorm bridges the gap and the run
+// completes. The dead domain's experts (their ONLY r=1 replica gone) light both
+// the renorm and the `suspect` alarm; the survivors answer bit-exactly. All
+// spine-local — no wire change (ADR-0024). These locks are model-free + netns-free
+// (plain `cargo test`); the shaped-uplink netns arm is `netem_churn` below.
+// -------------------------------------------------------------------------
+
+/// Node descriptors whose `failure_domain` labels are given explicitly, so two
+/// nodes can SHARE a domain (a correlated-churn cell) — the thing `uniform_nodes`
+/// (one domain per node) cannot express. `id` stays per-node distinct.
+fn domain_nodes(domains: &[&str]) -> Vec<NodeDesc> {
+    domains
+        .iter()
+        .enumerate()
+        .map(|(j, d)| NodeDesc {
+            id: format!("n{j}"),
+            failure_domain: (*d).to_string(),
+            uplink_class: 1,
+            ram_class: 1,
+        })
+        .collect()
+}
+
+/// The node indices whose domain is in `dead` — a correlated-churn event kills
+/// exactly this set (every node sharing the failed domain).
+fn indices_in_domains(domains: &[&str], dead: &[&str]) -> HashSet<usize> {
+    domains
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| dead.contains(d))
+        .map(|(j, _)| j)
+        .collect()
+}
+
+/// Spawn a placed pool for `map`, but make every node index in `dead` a BLACK
+/// HOLE (accepts + drains, never answers) — a whole failure domain wedged while
+/// the map still points at it (the correlated-churn down-window). Live nodes hold
+/// their `map.subset_for(j)` slice as usual; the dead ones answer nothing, so
+/// their experts stall out to the ADR-0008 renorm and light the `suspect` alarm.
+fn spawn_placed_pool_with_dead(
+    carved: &Path,
+    map: &PlacementMap,
+    node_count: usize,
+    all_experts: &[(u16, u16)],
+    dead: &HashSet<usize>,
+) -> (
+    Vec<String>,
+    Vec<Arc<AtomicBool>>,
+    Vec<thread::JoinHandle<()>>,
+) {
+    let mut addrs = Vec::with_capacity(node_count);
+    let mut dones = Vec::with_capacity(node_count);
+    let mut handles = Vec::with_capacity(node_count);
+    for j in 0..node_count {
+        let done = Arc::new(AtomicBool::new(false));
+        let (addr, handle) = if dead.contains(&j) {
+            spawn_blackhole(done.clone())
+        } else {
+            let keep: HashSet<(u16, u16)> = map.subset_for(j).into_iter().collect();
+            spawn_subset_node(carved, all_experts, keep, done.clone())
+        };
+        addrs.push(addr.to_string());
+        dones.push(done);
+        handles.push(handle);
+    }
+    (addrs, dones, handles)
+}
+
+/// The union of the map subsets held by the dead node indices — the experts a
+/// correlated-domain churn strands (their sole r=1 replica gone → renorm holes).
+fn dead_expert_set(map: &PlacementMap, dead: &HashSet<usize>) -> Vec<(u16, u16)> {
+    let mut s: HashSet<(u16, u16)> = HashSet::new();
+    for &j in dead {
+        s.extend(map.subset_for(j));
+    }
+    let mut v: Vec<(u16, u16)> = s.into_iter().collect();
+    v.sort_unstable();
+    v
+}
+
+/// M5.A CORRELATED-CHURN RENORM LOCK (ADR-0008): a whole failure domain dies
+/// mid-run, yet no step stalls — the replica-set budget stalls each silent node,
+/// the spine renorms over the survivors, and the run COMPLETES. The stranded
+/// domain's experts renorm on every step they route (`renorm_steps > 0`,
+/// degradation MEASURED not silent), bit-for-bit a `LocalDispatch` that dropped
+/// exactly that expert set. Then the operator re-replicates: `replace_placement`
+/// over the SURVIVING nodes restores full coverage and the next run renorms
+/// nothing — the elasticity round-trip.
+#[test]
+fn churn_domain_renorms_and_completes() {
+    let root = tmp("churn-renorms");
+    let (model, carved) = fixture_and_carve(&root);
+    let manifest = Manifest::load(&carved.join(manifest::FILE_NAME)).unwrap();
+    let hidden = manifest.model.hidden as usize;
+    let identity = *blake3::hash(&manifest.canonical_bytes()).as_bytes();
+    let experts = manifest.model.experts_per_layer as usize;
+    // top_k = experts routes every expert every step, so a stranded expert renorms
+    // on every layer-step it holds (the placed_replace_leave discipline).
+    let spine = Spine::load(&model, &manifest, config(hidden, experts)).unwrap();
+    let all = all_expert_keys(&manifest);
+    // Four nodes; the first two SHARE domain "d0" — the correlated-churn cell that
+    // dies together. Survivors live in distinct domains "d1", "d2".
+    let domains = ["d0", "d0", "d1", "d2"];
+    let dead = indices_in_domains(&domains, &["d0"]);
+    let descs = domain_nodes(&domains);
+    // r = 1: each expert has a single replica, so losing the two "d0" nodes strands
+    // exactly the experts they held (no distinct-domain backup to bridge them).
+    let map = build_placement(&descs, &bootstrap_heat(&all, &[]), 1).unwrap();
+    let deadset = dead_expert_set(&map, &dead);
+    assert!(
+        !deadset.is_empty(),
+        "the churned domain must actually hold experts (else the test is vacuous)"
+    );
+
+    let prompts: Vec<&[u32]> = vec![&[1, 2, 3], &[3, 2, 1]];
+    let tokens = 3usize;
+    // A generous budget: healthy localhost gathers clear in << 40 ms, so the hedge
+    // never fires for a survivor; only the dead nodes ever pay it (one stall each,
+    // per dead-routing layer-step) — the honest bound on this test's wall-clock.
+    let hedge = Duration::from_millis(40);
+
+    // CHURN: connect the pool with domain "d0" black-holed while the map still
+    // points at it (the down-window before re-placement).
+    let (addrs, dones, handles) =
+        spawn_placed_pool_with_dead(&carved, &map, descs.len(), &all, &dead);
+    let mut disp = PlacedDispatch::connect(
+        &addrs,
+        || make_codec("fp8"),
+        identity,
+        hidden,
+        map.clone(),
+        Some(hedge),
+    )
+    .unwrap();
+    let (out_churn, stats_churn) = spine.generate_batch(&mut disp, &prompts, tokens).unwrap();
+    assert!(
+        stats_churn.renorm_steps > 0,
+        "the stranded domain's experts must renorm during the down-window"
+    );
+    let (local_stranded, _) = via_local_batch(&spine, &carved, "fp8", &prompts, tokens, &deadset);
+    assert_eq!(
+        out_churn, local_stranded,
+        "a churned run renorms bit-for-bit like a local run that dropped the dead domain's experts"
+    );
+
+    // RE-REPLICATE: the operator re-places over the SURVIVORS (domains d1, d2),
+    // which re-carves full coverage; the next run renorms nothing (coverage
+    // restored) and is bit-for-bit the full local run.
+    let surv_descs = domain_nodes(&["d1", "d2"]);
+    let surv_map = build_placement(&surv_descs, &bootstrap_heat(&all, &[]), 1).unwrap();
+    assert!(
+        all.iter()
+            .all(|&(l, e)| !surv_map.replicas_of(l, e).is_empty()),
+        "re-replication over the survivors must restore full coverage"
+    );
+    let (surv_addrs, surv_dones, surv_handles) =
+        spawn_placed_pool(&carved, &surv_map, surv_descs.len(), &all);
+    let surv_nodes = connect_node_slice(&surv_addrs, &carved, "fp8");
+    disp.replace_placement(surv_nodes, surv_map);
+    let (out_recovered, stats_recovered) =
+        spine.generate_batch(&mut disp, &prompts, tokens).unwrap();
+    assert_eq!(
+        stats_recovered.renorm_steps, 0,
+        "re-replication restored full coverage — nothing renorms"
+    );
+    drop(disp);
+
+    let (local_full, _) = via_local_batch(&spine, &carved, "fp8", &prompts, tokens, &[]);
+    assert_eq!(
+        out_recovered, local_full,
+        "the re-replicated run is bit-for-bit the full local run"
+    );
+
+    shutdown_pool(&dones, &addrs, handles);
+    shutdown_pool(&surv_dones, &surv_addrs, surv_handles);
+}
+
+/// M5.A DEAD-REPLICA ALARM LOCK (ADR-0008 heat-map corollary): a correlated churn
+/// that strands experts surfaces them on `PlacedDispatch::suspect_replicas` — the
+/// experts the dead domain held (dispatched every step, answered on none → 100 %
+/// failure) are flagged EXACTLY, and the survivors' experts (answered every step)
+/// are NOT. This is the "creeping capacity loss is never silent" half of ADR-0008,
+/// measured off the spine-local heat, never on the wire.
+#[test]
+fn churn_flags_dead_replicas() {
+    let root = tmp("churn-suspect");
+    let (model, carved) = fixture_and_carve(&root);
+    let manifest = Manifest::load(&carved.join(manifest::FILE_NAME)).unwrap();
+    let hidden = manifest.model.hidden as usize;
+    let identity = *blake3::hash(&manifest.canonical_bytes()).as_bytes();
+    let experts = manifest.model.experts_per_layer as usize;
+    let spine = Spine::load(&model, &manifest, config(hidden, experts)).unwrap();
+    let all = all_expert_keys(&manifest);
+    let domains = ["d0", "d0", "d1", "d2"];
+    let dead = indices_in_domains(&domains, &["d0"]);
+    let descs = domain_nodes(&domains);
+    let map = build_placement(&descs, &bootstrap_heat(&all, &[]), 1).unwrap();
+    let deadset = dead_expert_set(&map, &dead);
+    assert!(!deadset.is_empty(), "the churned domain must hold experts");
+
+    let prompts: Vec<&[u32]> = vec![&[1, 2, 3], &[3, 2, 1]];
+    let tokens = 3usize;
+    let hedge = Duration::from_millis(40);
+
+    // The domain is dead for the WHOLE measured window (no prior healthy run on
+    // this dispatcher), so the stranded experts are 100 % failure — the exact
+    // condition `suspect_replicas` (`HeatMap::suspect(1, 1, 1)`) flags.
+    let (addrs, dones, handles) =
+        spawn_placed_pool_with_dead(&carved, &map, descs.len(), &all, &dead);
+    let mut disp = PlacedDispatch::connect(
+        &addrs,
+        || make_codec("fp8"),
+        identity,
+        hidden,
+        map.clone(),
+        Some(hedge),
+    )
+    .unwrap();
+    let (_out, stats) = spine.generate_batch(&mut disp, &prompts, tokens).unwrap();
+    assert!(
+        stats.renorm_steps > 0,
+        "the run must have renormed over the dead domain"
+    );
+
+    let mut suspect = disp.suspect_replicas();
+    suspect.sort_unstable();
+    assert_eq!(
+        suspect, deadset,
+        "the alarm must flag EXACTLY the dead domain's expert set"
+    );
+    // The survivors answered every dispatch, so none of their experts is suspect.
+    for &(l, e) in &all {
+        if !deadset.contains(&(l, e)) {
+            assert!(
+                !suspect.contains(&(l, e)),
+                "a survivor expert ({l},{e}) must not be flagged suspect"
+            );
+        }
+    }
+    drop(disp);
+    shutdown_pool(&dones, &addrs, handles);
+}
+
+/// M5.A RENORM-QUALITY-DIP LOCK (ADR-0008 canary corollary): as the fraction of
+/// experts forced not-held (a domain-down window) GROWS, the renormed output
+/// moves monotonically further from the full-coverage answer — degradation is
+/// MEASURED, not silent — and returns to EXACTLY the baseline when coverage is
+/// restored (re-replication). The metric is the mean L2 distance of the renormed
+/// per-position logits from the full-coverage logits, scored through the canary's
+/// own `Spine::logits_per_position` primitive; the literal canary NLL
+/// (`canary::teacher_forced_nll`) is reported alongside to show it registers the
+/// dip deterministically.
+///
+/// HONEST FIXTURE CAVEAT (ADR-0007): on RANDOM fixture weights the canary NLL
+/// drifts toward the ln(vocab) uniform-prior floor under dropout rather than
+/// strictly worsening, so the SIGN/curve of a real perplexity dip is only
+/// measurable on the real card — the `renorm_quality_dip_real_model`
+/// (`KENNY_MODEL_DIR`) arm. What holds model-free is the divergence-from-full
+/// signal being monotone in the down-fraction and cleanly recoverable.
+#[test]
+fn renorm_quality_dip_grows_with_dropout() {
+    let root = tmp("renorm-quality-dip");
+    // A wider fixture (8 experts × 4 MoE layers) gives a longer dropout ladder and
+    // clean separation between rungs; top_k = experts routes every expert, so each
+    // additional drop forces one more not-held (renorm) per position.
+    let params = Params {
+        layers: 4,
+        experts: 8,
+        hidden: 8,
+        inter: 4,
+        vocab: 32,
+        seed: 42,
+    };
+    let model = root.join("model");
+    fixture::generate(&params, &model).unwrap();
+    let carved = root.join("carved");
+    carve::run(
+        &model,
+        &Options {
+            out: carved.clone(),
+            model_name: "renorm-quality".into(),
+            model_rev: String::new(),
+            dtype: Dtype::Bf16,
+        },
+    )
+    .unwrap();
+    let manifest = Manifest::load(&carved.join(manifest::FILE_NAME)).unwrap();
+    let hidden = manifest.model.hidden as usize;
+    let experts = manifest.model.experts_per_layer as usize;
+    let moe_layers = manifest.model.moe_layers;
+    let spine = Spine::load(&model, &manifest, config(hidden, experts)).unwrap();
+
+    // A fixed in-vocab canary prompt set (vocab 32).
+    let prompts: Vec<Vec<u32>> = vec![
+        vec![1, 5, 9, 13, 17, 21],
+        vec![2, 4, 8, 16, 3, 7],
+        vec![31, 17, 5, 29, 11, 23],
+        vec![0, 1, 2, 3, 4, 5],
+    ];
+
+    // Full-coverage per-position logits — the baseline every dropout level is
+    // measured against (the "no domain down" answer).
+    let mut full = LocalDispatch::new(&carved, make_codec("fp8")).unwrap();
+    let teacher: Vec<Vec<Vec<f32>>> = prompts
+        .iter()
+        .map(|p| spine.logits_per_position(&mut full, p).unwrap())
+        .collect();
+
+    // Mean L2 distance of a dropout path's per-position logits from `teacher`.
+    let dip = |drops: &[(u16, u16)]| -> f64 {
+        let mut d = LocalDispatch::new(&carved, make_codec("fp8")).unwrap();
+        for &(l, e) in drops {
+            d.node_mut().drop_expert(l, e);
+        }
+        let mut acc = 0f64;
+        let mut n = 0usize;
+        for (pi, p) in prompts.iter().enumerate() {
+            let lp = spine.logits_per_position(&mut d, p).unwrap();
+            for (pos, row) in lp.iter().enumerate() {
+                let t = &teacher[pi][pos];
+                let sq: f64 = row
+                    .iter()
+                    .zip(t)
+                    .map(|(a, b)| {
+                        let df = (*a - *b) as f64;
+                        df * df
+                    })
+                    .sum();
+                acc += sq.sqrt();
+                n += 1;
+            }
+        }
+        acc / n as f64
+    };
+    // The literal canary NLL (nats/token) at a dropout level — the same
+    // teacher-forced score the perplexity canary reports.
+    let nll = |drops: &[(u16, u16)]| -> f64 {
+        let mut d = LocalDispatch::new(&carved, make_codec("fp8")).unwrap();
+        for &(l, e) in drops {
+            d.node_mut().drop_expert(l, e);
+        }
+        let (sum, cnt) = kenny::canary::teacher_forced_nll(&spine, &mut d, &prompts).unwrap();
+        sum / cnt as f64
+    };
+
+    // The down-fraction ladder: drop k experts on EVERY MoE layer (a growing
+    // fraction of the pool's experts forced not-held), k = 0..experts−1 (always
+    // leave one expert so the renorm has an answered subset to normalize over).
+    eprintln!("down_frac\tl2_dip\tcanary_nll");
+    let mut prev_dip = -1.0f64;
+    let baseline_dip = dip(&[]);
+    let baseline_nll = nll(&[]);
+    assert_eq!(
+        baseline_dip, 0.0,
+        "full coverage cannot diverge from itself"
+    );
+    for k in 0..experts {
+        let drops: Vec<(u16, u16)> = (0..moe_layers as u16)
+            .flat_map(|l| (0..k as u16).map(move |e| (l, e)))
+            .collect();
+        let d = dip(&drops);
+        let frac = k as f64 / experts as f64;
+        eprintln!("{frac:.3}\t{d:.6}\t{:.6}", nll(&drops));
+        assert!(
+            d.is_finite() && d >= 0.0,
+            "the dip metric must be a finite non-negative distance"
+        );
+        assert!(
+            d > prev_dip,
+            "the renorm quality dip must GROW with the down-fraction: \
+             drop {k}/{experts} gave {d:.6} <= previous {prev_dip:.6}"
+        );
+        prev_dip = d;
+    }
+    assert!(
+        prev_dip > 0.0,
+        "some dropout must have registered a measurable dip (not silent)"
+    );
+
+    // Re-replication (coverage restored) returns EXACTLY to the baseline — the
+    // canary is a clean round-trip, not a one-way ratchet.
+    assert_eq!(
+        dip(&[]),
+        baseline_dip,
+        "restoring full coverage returns the dip to exactly the baseline (0)"
+    );
+    assert_eq!(
+        nll(&[]),
+        baseline_nll,
+        "the canary NLL is deterministic — full coverage reproduces the baseline"
+    );
+    // The canary observably registers the churn (the dip is not silent): the
+    // max-dropout NLL differs from the full-coverage NLL.
+    let max_drops: Vec<(u16, u16)> = (0..moe_layers as u16)
+        .flat_map(|l| (0..(experts as u16 - 1)).map(move |e| (l, e)))
+        .collect();
+    assert!(
+        (nll(&max_drops) - baseline_nll).abs() > 0.0,
+        "the canary NLL must move off baseline under dropout — degradation is measured"
+    );
+}
+
 /// REGRESSION LOCK: the replica-set hedge with NO loss is bit-for-bit the local
 /// path and NEVER fires. `r = 2` over two nodes replicates every expert on both;
 /// the primary (round 0) answers every layer within a generous hedge delay, so
@@ -2273,6 +2684,100 @@ fn real_model_perplexity_canary() {
         r.delta_ppl
     );
     assert_eq!(r.scored_tokens, 2 * 15, "prompts x (len - 1) transitions");
+}
+
+// -------------------------------------------------------------------------
+// M5.A — renorm quality dip under EXPERT DROPOUT against the REAL Qwen3-30B-A3B
+// (KENNY_MODEL_DIR). The fixture `renorm_quality_dip_grows_with_dropout` proves
+// the dip is monotone in the down-fraction and recoverable, but on random weights
+// the canary NLL cannot show the SIGN of a real perplexity loss (ADR-0007). This
+// arm reports the real number: teacher-forced perplexity of the fp8 path as a
+// growing fraction of experts is forced not-held across every MoE layer — the
+// "smooth quality dip, not an outage" ADR-0008 promises, measured on the real
+// card. Deliverable is the BENCH Δppl-under-dropout curve; budget-capped (a small
+// fixed prompt set, three dropout rungs) per the plan. Gated — CI never downloads
+// a model.
+// -------------------------------------------------------------------------
+#[test]
+fn renorm_quality_dip_real_model() {
+    let Some(dir) = std::env::var_os("KENNY_MODEL_DIR") else {
+        eprintln!("KENNY_MODEL_DIR unset — skipping M5.A real-model dropout dip");
+        return;
+    };
+    let model_dir = PathBuf::from(dir);
+    let carved = Path::new(env!("CARGO_TARGET_TMPDIR")).join("real-carve-fp8");
+    std::fs::create_dir_all(&carved).unwrap();
+    carve::run(
+        &model_dir,
+        &Options {
+            out: carved.clone(),
+            model_name: "qwen3-30b-a3b".into(),
+            model_rev: String::new(),
+            dtype: Dtype::Fp8,
+        },
+    )
+    .unwrap();
+    let manifest = Manifest::load(&carved.join(manifest::FILE_NAME)).unwrap();
+    let experts = manifest.model.experts_per_layer as usize;
+    let moe_layers = manifest.model.moe_layers;
+    let spine = Spine::load(&model_dir, &manifest, Config::default()).unwrap();
+    let vocab = spine.vocab();
+
+    // Small fixed in-vocab prompt set (the plan's budget cap): 2 sequences × 8.
+    let prompts: Vec<Vec<u32>> = (0..2u64)
+        .map(|p| {
+            let mut x = 0x9E37_79B9_7F4A_7C15u64 ^ p.wrapping_mul(0xD1B5_4A32_D192_ED03);
+            (0..8)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    (x % vocab as u64) as u32
+                })
+                .collect()
+        })
+        .collect();
+
+    // Perplexity of the fp8 path with `drops` forced not-held (renorm over the rest).
+    let ppl = |drops: &[(u16, u16)]| -> f64 {
+        let mut d = LocalDispatch::new(&carved, make_codec("fp8")).unwrap();
+        for &(l, e) in drops {
+            d.node_mut().drop_expert(l, e);
+        }
+        let (sum, cnt) = kenny::canary::teacher_forced_nll(&spine, &mut d, &prompts).unwrap();
+        (sum / cnt as f64).exp()
+    };
+
+    eprintln!(
+        "M5.A real dropout dip: {moe_layers} MoE layers, {experts} experts/layer, fp8, 2×8 prompts"
+    );
+    eprintln!("down_frac\tdropped/layer\tperplexity\tΔppl_vs_full\telapsed");
+    let base = ppl(&[]);
+    let mut last = base;
+    for &k in &[0usize, experts / 8, experts / 4] {
+        let drops: Vec<(u16, u16)> = (0..moe_layers as u16)
+            .flat_map(|l| (0..k as u16).map(move |e| (l, e)))
+            .collect();
+        let t0 = std::time::Instant::now();
+        let p = ppl(&drops);
+        eprintln!(
+            "{:.4}\t{k}\t{p:.5}\t{:+.5}\t{:.1?}",
+            k as f64 / experts as f64,
+            p - base,
+            t0.elapsed()
+        );
+        assert!(
+            p.is_finite() && p > 0.0,
+            "perplexity must be finite positive"
+        );
+        last = p;
+    }
+    // Real experts carry signal, so forcing a fraction not-held should degrade (not
+    // improve) perplexity — a loose floor; the number is the deliverable.
+    assert!(
+        last >= base * 0.999,
+        "dropping real experts should not IMPROVE perplexity: {last} < {base}"
+    );
 }
 
 // -------------------------------------------------------------------------
@@ -3041,4 +3546,203 @@ fn report_placement(
             }
         }
     }
+}
+
+// -------------------------------------------------------------------------
+// M5.A — SIMULATED correlated churn across shaped uplinks (ADR-0008 / ADR-0009).
+// The netns twin of `churn_domain_renorms_and_completes`: N `kenny` nodes bound to
+// distinct loopback IPs behind their own `tc netem` bands, grouped into failure
+// DOMAINS of `KENNY_NETEM_CHURN_DOMAIN_SIZE` nodes each (a household/rack). A churn
+// event kills a whole domain (its nodes go BLACK HOLE while the map still points at
+// them), and the report shows the down-window bridging: no step stalls (the
+// replica-set budget stalls each silent node, the spine renorms over the
+// survivors), `renorm_steps > 0`, `suspect_replicas` flags the dead domain, and a
+// re-place over the survivors restores coverage. Honestly labelled SIMULATION
+// (netem on `lo`, synthetic uplinks, one host) — the real correlated-churn party
+// stays M5.C / #7. Gated on KENNY_NETEM_NODES; a plain `cargo test` never runs it
+// (the CI-runnable locks are `churn_*` above, no netns, no model).
+// -------------------------------------------------------------------------
+
+/// Spawn a placed pool at shaped BINDS, making every node index in `dead` a BLACK
+/// HOLE (on an unshaped loopback address — a dead node never answers, so its
+/// egress shaping is moot). Live nodes bind their shaped IP and hold their
+/// `map.subset_for(j)` slice. The shaped twin of `spawn_placed_pool_with_dead`.
+fn spawn_shaped_pool_with_dead(
+    carved: &Path,
+    map: &PlacementMap,
+    binds: &[String],
+    all_experts: &[(u16, u16)],
+    dead: &HashSet<usize>,
+) -> (
+    Vec<String>,
+    Vec<Arc<AtomicBool>>,
+    Vec<thread::JoinHandle<()>>,
+) {
+    let mut addrs = Vec::with_capacity(binds.len());
+    let mut dones = Vec::with_capacity(binds.len());
+    let mut handles = Vec::with_capacity(binds.len());
+    for (j, bind) in binds.iter().enumerate() {
+        let done = Arc::new(AtomicBool::new(false));
+        let (addr, handle) = if dead.contains(&j) {
+            spawn_blackhole(done.clone())
+        } else {
+            let keep: HashSet<(u16, u16)> = map.subset_for(j).into_iter().collect();
+            spawn_subset_node_at(carved, all_experts, keep, done.clone(), bind)
+        };
+        addrs.push(addr.to_string());
+        dones.push(done);
+        handles.push(handle);
+    }
+    (addrs, dones, handles)
+}
+
+#[test]
+fn netem_churn() {
+    let Some(spec) = std::env::var_os("KENNY_NETEM_NODES") else {
+        eprintln!(
+            "KENNY_NETEM_NODES unset — skipping M5.A netem correlated-churn sim \
+             (run via tools/netem-bench.sh --nodes 4 --churn)"
+        );
+        return;
+    };
+    let shaped = parse_shaped_nodes(&spec.to_string_lossy());
+    let dsize: usize = std::env::var("KENNY_NETEM_CHURN_DOMAIN_SIZE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
+    assert!(
+        shaped.len() > dsize,
+        "correlated churn needs a dead domain of {dsize} nodes AND at least one surviving node"
+    );
+    // Group consecutive nodes into failure domains of `dsize`; domain 0 is the
+    // churn victim. uplink_class ∝ shaped rate (hot experts flow to fat uplinks).
+    let descs: Vec<NodeDesc> = shaped
+        .iter()
+        .enumerate()
+        .map(|(j, n)| NodeDesc {
+            id: n.ip.clone(),
+            failure_domain: format!("dom{}", j / dsize),
+            uplink_class: n.rate_mbit.max(1),
+            ram_class: 1,
+        })
+        .collect();
+    let dead: HashSet<usize> = (0..dsize).collect();
+
+    let root = tmp("netem-churn");
+    // Compute≈0 fixture; the renorm/suspect down-window behaviour is layer-count
+    // independent, so a few MoE barriers suffice (the per-fan cost is bounded by
+    // the replica-set budget the dead nodes always pay, per layer-step — unlike
+    // the p99-tail placement sim, churn does not need the 48-barrier depth).
+    let params = Params {
+        layers: 8,
+        experts: 8,
+        hidden: 8,
+        inter: 4,
+        vocab: 32,
+        seed: 42,
+    };
+    let model = root.join("model");
+    fixture::generate(&params, &model).unwrap();
+    let carved = root.join("carved");
+    carve::run(
+        &model,
+        &Options {
+            out: carved.clone(),
+            model_name: "netem-churn".into(),
+            model_rev: String::new(),
+            dtype: Dtype::Fp8,
+        },
+    )
+    .unwrap();
+    let manifest = Manifest::load(&carved.join(manifest::FILE_NAME)).unwrap();
+    let hidden = manifest.model.hidden as usize;
+    let identity = *blake3::hash(&manifest.canonical_bytes()).as_bytes();
+    let moe_layers = manifest.model.moe_layers as u64;
+    let experts = manifest.model.experts_per_layer as usize;
+    let spine = Spine::load(&model, &manifest, config(hidden, experts)).unwrap();
+    let all = all_expert_keys(&manifest);
+    // r = 1: killing domain 0 strands exactly the experts its nodes hold.
+    let map = build_placement(&descs, &bootstrap_heat(&all, &[]), 1).unwrap();
+    let mut deadset = dead_expert_set(&map, &dead);
+    deadset.sort_unstable();
+    let binds: Vec<String> = shaped.iter().map(|n| format!("{}:0", n.ip)).collect();
+
+    let prompts: Vec<&[u32]> = vec![&[1, 2, 3], &[3, 2, 1]];
+    let steps = 2usize;
+    // The replica-set budget must clear the SLOWEST surviving uplink's round-trip,
+    // or a slow-but-healthy survivor is stalled and false-flagged suspect (a real
+    // ADR-0010 hedge × ADR-0008 alarm interaction — worth stating, not asserting
+    // against): budget = 3× the slowest one-way delay + 150 ms of slack. The dead
+    // nodes NEVER answer, so they always pay this budget once per layer-step.
+    let max_delay = shaped.iter().map(|n| n.delay_ms).max().unwrap_or(0);
+    let hedge = Duration::from_millis(max_delay * 3 + 150);
+
+    eprintln!(
+        "M5.A netem churn: {moe_layers} MoE layers, {} shaped nodes, domain size {dsize}, \
+         dead domain dom0 = nodes {:?}, {} stranded experts, budget {} ms, fp8 wire",
+        shaped.len(),
+        dead,
+        deadset.len(),
+        hedge.as_millis()
+    );
+
+    // CHURN window: domain 0 black-holed while the map still points at it.
+    let (addrs, dones, handles) = spawn_shaped_pool_with_dead(&carved, &map, &binds, &all, &dead);
+    let mut disp = PlacedDispatch::connect(
+        &addrs,
+        || make_codec("fp8"),
+        identity,
+        hidden,
+        map.clone(),
+        Some(hedge),
+    )
+    .unwrap();
+    let (_out, stats) = spine.generate_batch(&mut disp, &prompts, steps).unwrap();
+    let mut suspect = disp.suspect_replicas();
+    suspect.sort_unstable();
+    let (median, p99) = stats.latency_median_p99();
+    eprintln!(
+        "  down-window: renorm_steps={} step_median={median:.2?} step_p99={p99:.2?} \
+         suspect={} (dead domain holds {})",
+        stats.renorm_steps,
+        suspect.len(),
+        deadset.len()
+    );
+    assert!(
+        stats.renorm_steps > 0,
+        "the churn down-window must renorm over the dead domain"
+    );
+    // The dead domain's experts are ALWAYS flagged; the shaped sim may also flag a
+    // slow-but-healthy survivor stalled by the hedge budget (reported above, not a
+    // failure — that is the honest ADR-0010 × ADR-0008 interaction), so this is a
+    // SUPERSET check, unlike the RTT≈0 `churn_flags_dead_replicas` exact lock.
+    for &(l, e) in &deadset {
+        assert!(
+            suspect.contains(&(l, e)),
+            "the suspect alarm must flag the dead domain's expert ({l},{e})"
+        );
+    }
+
+    // RE-REPLICATE over the survivors (nodes dsize..): coverage restored, no renorm.
+    let surv_descs: Vec<NodeDesc> = descs[dsize..].to_vec();
+    let surv_binds: Vec<String> = binds[dsize..].to_vec();
+    let surv_map = build_placement(&surv_descs, &bootstrap_heat(&all, &[]), 1).unwrap();
+    let no_dead: HashSet<usize> = HashSet::new();
+    let (surv_addrs, surv_dones, surv_handles) =
+        spawn_shaped_pool_with_dead(&carved, &surv_map, &surv_binds, &all, &no_dead);
+    let surv_nodes = connect_node_slice(&surv_addrs, &carved, "fp8");
+    disp.replace_placement(surv_nodes, surv_map);
+    let (_out2, stats2) = spine.generate_batch(&mut disp, &prompts, steps).unwrap();
+    eprintln!(
+        "  re-replicated: renorm_steps={} (coverage restored)",
+        stats2.renorm_steps
+    );
+    assert_eq!(
+        stats2.renorm_steps, 0,
+        "re-replication over the survivors restores full coverage"
+    );
+    drop(disp);
+
+    shutdown_pool(&dones, &addrs, handles);
+    shutdown_pool(&surv_dones, &surv_addrs, surv_handles);
 }

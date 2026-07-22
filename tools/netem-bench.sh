@@ -41,6 +41,14 @@
 # order — the #28 order-independence repro. Per-node p99 must still track each
 # node's own delay (the netem_placement fixture arm asserts it).
 #   tools/netem-bench.sh --nodes 3 --placement --reverse
+# Correlated-churn sim (M5.A, issue #7): the same shaped multi-node topology, but
+# the nodes are grouped into failure DOMAINS of KENNY_NETEM_CHURN_DOMAIN_SIZE (2 by
+# default) and a whole domain is killed mid-run (its nodes go black hole). Reports
+# the ADR-0008 down-window: renorm bridges the gap, the run completes, the suspect
+# alarm flags the dead domain, and a re-place over the survivors restores coverage.
+# Needs > domain-size nodes (a dead domain plus a survivor). SIMULATION.
+#   tools/netem-bench.sh --nodes 4 --churn
+#   KENNY_NETEM_CHURN_DOMAIN_SIZE=2 tools/netem-bench.sh --nodes 6 --churn
 # The per-node shaping profile (delay ms / rate Mbit) is the fixed heterogeneous
 # class list below (node 0 = fat-and-near, ascending delay + descending rate; with
 # --reverse, node 0 = thin-and-far, descending delay); the spine->node egress is
@@ -60,6 +68,7 @@ placement=
 loss_hol=
 hedge=
 reverse=
+churn=
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -71,7 +80,8 @@ while [ $# -gt 0 ]; do
     --reverse) reverse=1; shift ;;
     --loss-hol) loss_hol=1; shift ;;
     --hedge) hedge=1; shift ;;
-    -h|--help) sed -n '2,48p' "$0"; exit 0 ;;
+    --churn) churn=1; shift ;;
+    -h|--help) sed -n '2,56p' "$0"; exit 0 ;;
     *) echo "netem-bench: unknown argument '$1'" >&2; exit 2 ;;
   esac
 done
@@ -129,8 +139,13 @@ node_classes="20:1000 60:100 100:50 150:20 250:10"
 # A dedicated pfifo band (1:1) carries everything unmatched (incl. the node->spine
 # return traffic to 127.0.0.1) unshaped, so a node's measured RTT ~= its one-way
 # delay. Real-model anchor when KENNY_MODEL_DIR is set (fixture arm otherwise).
+# The Rust test to run inside the shaped namespace: netem_placement (per-node p99,
+# the default) or netem_churn (the M5.A correlated-churn down-window). Both stand
+# up the SAME shaped multi-node topology; churn additionally reads
+# KENNY_NETEM_CHURN_DOMAIN_SIZE to group nodes into failure domains.
 run_placement() {
   _n=$1
+  _test=${2:-netem_placement}
   _bands=$((_n + 1))
   # Select the first N shaping classes. With --reverse, assign them to node
   # indices in DESCENDING delay order (prepend instead of append), so node 0 is
@@ -165,9 +180,10 @@ run_placement() {
     _specs="${_specs:+$_specs }${_ip}:${_delay}:${_rate}"
     _j=$((_j + 1))
   done
-  echo "=== netem placement: $_n shaped nodes [$_nodes] ==="
+  echo "=== netem $_test: $_n shaped nodes [$_nodes] ==="
   KENNY_NETEM_NODES="$_nodes" \
   NETEM_BANDS="$_bands" \
+  NETEM_TEST="$_test" \
   NETEM_SPECS="$_specs" \
   unshare -rn sh -c '
     set -e
@@ -185,11 +201,15 @@ run_placement() {
       tc filter add dev lo protocol ip parent 1: prio 1 u32 match ip dst ${ip}/32 flowid 1:$b
       b=$((b + 1))
     done
-    exec cargo test --release --test dispatch netem_placement -- --nocapture --test-threads=1
+    exec cargo test --release --test dispatch "$NETEM_TEST" -- --nocapture --test-threads=1
   '
 }
 
-if [ -n "$placement" ]; then
+if [ -n "$churn" ]; then
+  # Correlated-churn sim (M5.A, #7): the shaped multi-node topology, but a whole
+  # failure domain is killed mid-run and the down-window is reported.
+  run_placement "$nodes" netem_churn
+elif [ -n "$placement" ]; then
   # Multi-node placement sim (M4, #6): heterogeneous per-node shaped uplinks.
   run_placement "$nodes"
 elif [ -n "$hedge" ]; then
