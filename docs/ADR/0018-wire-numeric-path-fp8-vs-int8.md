@@ -32,6 +32,26 @@ Decide with the table, not with taste. The paths are not mutually exclusive
 long-term (e.g. fp8 wire + int8 verification lane), but the default deployment
 path gets picked at M3.
 
+### M3 update (2026-07-22) — throughput axis settled by identity, decision deferred
+
+M3 settles only the **throughput** sub-axis of the three above, and it turns out
+to be a **non-discriminator**: fp8 E4M3 and int8 are both 1 byte/element
+(`WireCodec::elem_bytes == 1` for both), so bytes/token — and therefore the
+RTT-driven `t_step` measured under `tc netem` (BENCH "M3") — are **identical**
+between the two paths at any RTT. Throughput cannot break the tie.
+
+The **deciding quality axis** (perplexity delta vs bf16 on the canary sets) stays
+**blocked on the deferred ADR-0008 perplexity canary**, which does not yet exist.
+The standing quality signal carried forward is directional, not a decision: M0
+blob cosine (int8 ~8× tighter than fp8 at equal bytes — 1−cos 1.3e-4 vs 1.0e-3)
+and M1 end-to-end fp8 wire cosine 0.99985 (BENCH "M0"/"M1").
+
+Consequently this ADR is **amended, not accepted**: the default-path pick **and**
+the on-wire `Int8Codec` (a new `codec_id` + goldens + `kenny-format-auditor`
+sign-off) are **deferred to the perplexity-canary milestone**. Implementing the
+`Int8Codec` at M3 would buy only a non-deciding throughput proxy (identical bytes)
+at real consensus-surface cost, so it is deliberately out of M3 scope.
+
 ## Consequences
 
 - Until M3, all consensus surfaces (blob format, wire framing) carry explicit
@@ -43,8 +63,10 @@ path gets picked at M3.
 
 ## Accept when
 
-The M3 benchmark table (BENCH.md) exists and names the default path with
-numbers.
+The ADR-0008 perplexity canary exists and produces a per-path perplexity-delta
+table that names the default path. (M3's throughput numbers are in — BENCH.md —
+but they are a non-discriminator: equal bytes/element ⇒ equal `t_step`, so the
+tie is broken only by the quality axis, which the canary supplies.)
 
 ## Alternatives considered
 
