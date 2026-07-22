@@ -61,9 +61,33 @@ Implemented at M4 (issue #6):
   a concurrent `PlacedDispatch`. The BENCH numbers (per-node p99 spread tracking
   the shaped delays; hot experts landing on the fat uplinks) are the first real
   evidence the placement objective works; they are honestly labelled SIMULATION.
+The M5.A elasticity primitive (issue #7) landed next, spine-local on the same
+wire (`WIRE_VERSION` 1, goldens frozen):
+
+- `PlacedDispatch::replace_placement` (`src/spine.rs`) atomically swaps the node
+  set + `PlacementMap` BETWEEN steps — join/leave IS re-running `build_placement`
+  over the changed `NodeDesc` slice and installing the fresh map with a matching
+  `NodeDispatch` slice. Spine-local heat survives the swap (it steers placement,
+  not the numeric path); a leave that strands an expert with no distinct-domain
+  holder leaves it a placement hole → the ADR-0008 renorm, degradation that is
+  measured (`renorm_steps`), not silent, until the next re-place restores it.
+- `Node::add_expert` (`src/node.rs`) is the symmetric inverse of the wire-neutral
+  `drop_expert` (ADR-0024): a re-place that hands a node a `(layer, expert)` it
+  had shed restores coverage as a LIVE index mutation (the blob is already on
+  disk in the carve dir, its CID from the manifest), no process restart, the
+  serve loop and wire untouched — a re-added expert answers bit-identically.
+- CI locks (localhost, no netns, no model): `placed_replace_equals_local_bit_exact`
+  (a re-place onto a different-but-covering pool stays bit-for-bit local),
+  `placed_replace_leave_creates_hole_and_renorms` (a leave that strands an expert
+  renorms exactly like a dropped-replica local run), and
+  `node::add_expert_reinsert_answers_bit_exact`.
+
 - Still deferred to the M4 real party (#6) and M5: a *real*-geography per-node
   tail (populated, correlated churn, the ADR-0006 critical-mass crossover),
-  migration machinery, co-activation clustering, and the L1 hot-expert spine cache.
+  migration ORCHESTRATION (who moves what, when, live, across a real pool — the
+  `replace_placement`/`add_expert` primitives are the mechanism, the policy and
+  its validation need a real party; M5.C), co-activation clustering, and the L1
+  hot-expert spine cache.
 
 ## Alternatives considered
 

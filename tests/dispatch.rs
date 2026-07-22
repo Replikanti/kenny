@@ -1243,6 +1243,65 @@ fn run_placed_shaped(
     (outs, stats, per_node, labels)
 }
 
+/// Spawn `node_count` subset nodes, each holding ONLY its `map.subset_for(j)`
+/// slice (the complement dropped via `Node::drop_expert`), and return their dial
+/// addresses + shutdown handles. The building block both the initial pool and
+/// the re-placed pool of the M5.A elasticity locks stand up — a join/leave is
+/// two of these pools with a `replace_placement` between them.
+fn spawn_placed_pool(
+    carved: &Path,
+    map: &PlacementMap,
+    node_count: usize,
+    all_experts: &[(u16, u16)],
+) -> (
+    Vec<String>,
+    Vec<Arc<AtomicBool>>,
+    Vec<thread::JoinHandle<()>>,
+) {
+    let mut addrs = Vec::with_capacity(node_count);
+    let mut dones = Vec::with_capacity(node_count);
+    let mut handles = Vec::with_capacity(node_count);
+    for j in 0..node_count {
+        let done = Arc::new(AtomicBool::new(false));
+        let keep: HashSet<(u16, u16)> = map.subset_for(j).into_iter().collect();
+        let (addr, handle) = spawn_subset_node(carved, all_experts, keep, done.clone());
+        addrs.push(addr.to_string());
+        dones.push(done);
+        handles.push(handle);
+    }
+    (addrs, dones, handles)
+}
+
+/// Connect one `NodeDispatch` per address, matching the node-index order the new
+/// `PlacementMap` points into — the slice `PlacedDispatch::replace_placement`
+/// installs when the pool changes (join/leave).
+fn connect_node_slice(addrs: &[String], carved: &Path, which: &str) -> Vec<NodeDispatch> {
+    let manifest = Manifest::load(&carved.join(manifest::FILE_NAME)).unwrap();
+    let identity = *blake3::hash(&manifest.canonical_bytes()).as_bytes();
+    let hidden = manifest.model.hidden as usize;
+    addrs
+        .iter()
+        .map(|a| NodeDispatch::connect(a, make_codec(which), identity, hidden).unwrap())
+        .collect()
+}
+
+/// Signal every node in a pool to stop, wake its pending `accept`, and join.
+fn shutdown_pool(
+    dones: &[Arc<AtomicBool>],
+    addrs: &[String],
+    handles: Vec<thread::JoinHandle<()>>,
+) {
+    for done in dones {
+        done.store(true, Ordering::SeqCst);
+    }
+    for addr in addrs {
+        let _ = TcpStream::connect(addr);
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+}
+
 /// CI lock (localhost, no netns): the per-node latency accounting records one
 /// sample per node per fanned layer-step and labels them by dial address. This
 /// is the ADR-0009 per-node step-latency series the netem sim reports p99 over;
@@ -1481,6 +1540,152 @@ fn placed_renorm_on_placement_hole() {
             pstats.renorm_steps > 0,
             "codec {which}: the unplaced expert must renorm"
         );
+    }
+}
+
+/// M5.A ELASTICITY LOCK (ADR-0009): a live `PlacedDispatch::replace_placement`
+/// between steps — the join/leave core — is transparent. Run a placed generation
+/// over pool A (3 nodes, r=1 full coverage), then re-place onto a DIFFERENT
+/// topology (pool B, 2 nodes, still full coverage) and run again on the SAME
+/// dispatcher: both runs are bit-for-bit `LocalDispatch`, so swapping the node
+/// set + map mid-life changes only WHERE experts are served, never the answer.
+/// Spine-local heat survives the swap (it steers placement, not the numeric
+/// path). Both codecs, B > 1.
+#[test]
+fn placed_replace_equals_local_bit_exact() {
+    let root = tmp("placed-replace");
+    let (model, carved) = fixture_and_carve(&root);
+    let manifest = Manifest::load(&carved.join(manifest::FILE_NAME)).unwrap();
+    let hidden = manifest.model.hidden as usize;
+    let identity = *blake3::hash(&manifest.canonical_bytes()).as_bytes();
+    let spine = Spine::load(&model, &manifest, config(hidden, 2)).unwrap();
+    let all = all_expert_keys(&manifest);
+
+    let prompts: Vec<&[u32]> = vec![&[1, 2, 3], &[3, 2, 1]];
+    let tokens = 6usize;
+
+    for which in ["fp8", "bf16"] {
+        // Pool A: 3 nodes, r=1 disjoint, full coverage → nothing renorms.
+        let map_a = build_placement(&uniform_nodes(3), &bootstrap_heat(&all, &[]), 1).unwrap();
+        let (addrs_a, dones_a, handles_a) = spawn_placed_pool(&carved, &map_a, 3, &all);
+        let mut disp = PlacedDispatch::connect(
+            &addrs_a,
+            || make_codec(which),
+            identity,
+            hidden,
+            map_a,
+            None,
+        )
+        .unwrap();
+        let (out_a, stats_a) = spine.generate_batch(&mut disp, &prompts, tokens).unwrap();
+        assert_eq!(
+            stats_a.renorm_steps, 0,
+            "codec {which}: pool A has full coverage"
+        );
+
+        // LEAVE + JOIN as one re-place: a different pool B (2 nodes), still full
+        // coverage. Connect the new node slice, swap it in with its fresh map.
+        let map_b = build_placement(&uniform_nodes(2), &bootstrap_heat(&all, &[]), 1).unwrap();
+        let (addrs_b, dones_b, handles_b) = spawn_placed_pool(&carved, &map_b, 2, &all);
+        let nodes_b = connect_node_slice(&addrs_b, &carved, which);
+        disp.replace_placement(nodes_b, map_b);
+
+        let (out_b, stats_b) = spine.generate_batch(&mut disp, &prompts, tokens).unwrap();
+        assert_eq!(
+            stats_b.renorm_steps, 0,
+            "codec {which}: pool B also has full coverage"
+        );
+        drop(disp);
+
+        let (local, _) = via_local_batch(&spine, &carved, which, &prompts, tokens, &[]);
+        assert_eq!(
+            out_a, local,
+            "codec {which}: the pre-replace placed run is bit-for-bit local"
+        );
+        assert_eq!(
+            out_b, local,
+            "codec {which}: the post-replace run over the new pool is bit-for-bit local"
+        );
+
+        shutdown_pool(&dones_a, &addrs_a, handles_a);
+        shutdown_pool(&dones_b, &addrs_b, handles_b);
+    }
+}
+
+/// M5.A LEAVE-STRANDS-AN-EXPERT LOCK (ADR-0009 / ADR-0008): a re-place whose new
+/// pool no longer holds some routed expert turns it into a placement HOLE → the
+/// pre-existing not-held → renorm path, bit-for-bit a `LocalDispatch` that dropped
+/// that replica. Before the leave the pool covers everything (no renorm); after
+/// it, the stranded expert renorms on every step it routes — degradation that is
+/// MEASURED (`renorm_steps`), not silent. `top_k = experts` routes the hole every
+/// step. Both codecs.
+#[test]
+fn placed_replace_leave_creates_hole_and_renorms() {
+    let root = tmp("placed-replace-leave");
+    let (model, carved) = fixture_and_carve(&root);
+    let manifest = Manifest::load(&carved.join(manifest::FILE_NAME)).unwrap();
+    let hidden = manifest.model.hidden as usize;
+    let identity = *blake3::hash(&manifest.canonical_bytes()).as_bytes();
+    let experts = manifest.model.experts_per_layer as usize;
+    let spine = Spine::load(&model, &manifest, config(hidden, experts)).unwrap();
+    let all = all_expert_keys(&manifest);
+    let hole = (0u16, 3u16); // routed every step
+    let prompts: Vec<&[u32]> = vec![&[1, 2, 3], &[3, 2, 1]];
+    let tokens = 6usize;
+
+    for which in ["fp8", "bf16"] {
+        // Pool A: 2 nodes, FULL coverage — the soon-to-be hole IS placed.
+        let map_a = build_placement(&uniform_nodes(2), &bootstrap_heat(&all, &[]), 1).unwrap();
+        assert!(
+            !map_a.replicas_of(hole.0, hole.1).is_empty(),
+            "coverage is full before the leave"
+        );
+        let (addrs_a, dones_a, handles_a) = spawn_placed_pool(&carved, &map_a, 2, &all);
+        let mut disp = PlacedDispatch::connect(
+            &addrs_a,
+            || make_codec(which),
+            identity,
+            hidden,
+            map_a,
+            None,
+        )
+        .unwrap();
+        let (out_a, stats_a) = spine.generate_batch(&mut disp, &prompts, tokens).unwrap();
+        assert_eq!(
+            stats_a.renorm_steps, 0,
+            "codec {which}: full coverage before the leave"
+        );
+
+        // LEAVE: re-place with `hole` UNPLACED — the surviving pool no longer holds it.
+        let map_b = build_placement(&uniform_nodes(2), &bootstrap_heat(&all, &[hole]), 1).unwrap();
+        assert!(
+            map_b.replicas_of(hole.0, hole.1).is_empty(),
+            "the leave stranded the expert"
+        );
+        let (addrs_b, dones_b, handles_b) = spawn_placed_pool(&carved, &map_b, 2, &all);
+        let nodes_b = connect_node_slice(&addrs_b, &carved, which);
+        disp.replace_placement(nodes_b, map_b);
+
+        let (out_b, stats_b) = spine.generate_batch(&mut disp, &prompts, tokens).unwrap();
+        assert!(
+            stats_b.renorm_steps > 0,
+            "codec {which}: the stranded expert must renorm after the leave"
+        );
+        drop(disp);
+
+        let (local_full, _) = via_local_batch(&spine, &carved, which, &prompts, tokens, &[]);
+        let (local_hole, _) = via_local_batch(&spine, &carved, which, &prompts, tokens, &[hole]);
+        assert_eq!(
+            out_a, local_full,
+            "codec {which}: pre-leave is bit-for-bit the full local run"
+        );
+        assert_eq!(
+            out_b, local_hole,
+            "codec {which}: post-leave renorms exactly like a dropped-replica local run"
+        );
+
+        shutdown_pool(&dones_a, &addrs_a, handles_a);
+        shutdown_pool(&dones_b, &addrs_b, handles_b);
     }
 }
 

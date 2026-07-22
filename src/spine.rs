@@ -1133,6 +1133,37 @@ impl PlacedDispatch {
         &self.heat
     }
 
+    /// Atomically install a new node set + placement map between steps — the
+    /// M5.A elasticity core (ADR-0009). Join/leave IS this: a node-set change
+    /// re-runs `build_placement` over the changed `NodeDesc` slice, yielding a
+    /// fresh `PlacementMap` whose replica indices point into the NEW `nodes`
+    /// slice; the caller connects one `NodeDispatch` per surviving/joining node
+    /// (in the map's index order) and hands both in together so the next fan
+    /// dispatches over the new pool. A leave that strands an expert with no
+    /// distinct-domain holder leaves it an empty replica set — a placement hole
+    /// → the pre-existing not-held → renorm path (ADR-0008) — until the next
+    /// re-place restores coverage; a join lets the new node claim hot/cold
+    /// coverage per `build_placement`'s `better()`.
+    ///
+    /// Spine-local heat SURVIVES the swap (ADR-0004): the dispatch/failure log
+    /// is a property of the model's routing, not of any node, so re-placement
+    /// re-steers off the accumulated heat and the ADR-0008 `suspect` alarm keeps
+    /// its history. `hedge_delay` and the run-cumulative `hedges_fired` also
+    /// survive. The per-node latency series RESTARTS at the new node count —
+    /// node indices changed meaning, so the old samples no longer attribute.
+    ///
+    /// MUST be called only BETWEEN steps (after `dispatch_batch` returns), never
+    /// mid-fan: a leave during an in-flight fan renorms THAT step over the
+    /// survivors, and the NEXT step uses the new map. Pure spine-local state —
+    /// no envelope frame, `WIRE_VERSION` stays 1, every codec version stays 1,
+    /// every wire golden stays byte-identical (ADR-0024).
+    pub fn replace_placement(&mut self, nodes: Vec<NodeDispatch>, map: PlacementMap) {
+        let n = nodes.len();
+        self.nodes = nodes;
+        self.map = map;
+        self.per_node_lat = vec![Vec::new(); n];
+    }
+
     /// Phase 1 of the concurrent fan: write this node its sub-lists (one buffered
     /// `Dispatch` frame per stream) WITHOUT reading — hoisting every node's sends
     /// ahead of any blocking read is what overlaps the per-node round-trips.
