@@ -783,3 +783,128 @@ fn real_model_two_process_dispatch() {
         arg(&logits_ref)
     );
 }
+
+// -------------------------------------------------------------------------
+// M2 — localhost batching B-sweep against the REAL Qwen3-30B-A3B
+// (KENNY_MODEL_DIR). The M2 deliverable is BENCH.md numbers, not a pass/fail:
+// aggregate tok/s and per-STEP median/p99 as batch size B rises, plus exact
+// per-direction wire bytes reconciled to the framing constants. Loopback
+// topology (`spine ⇄ 127.0.0.1 ⇄ node`, the S7 harness): RTT≈0, so the §4.4
+// per-layer barrier has nothing to amortize — the number recorded honestly
+// baselines the real-LAN / M3 `tc netem` re-run where the amortization win
+// appears. Gated: CI never downloads a model.
+// -------------------------------------------------------------------------
+
+/// Distinct short prompts, one per stream index (mirrors the CLI's seed-derived
+/// batch prompts): stream `s` routes independently so B streams are genuinely
+/// independent work, not B copies of one.
+fn bench_prompts(b: usize, len: usize, vocab: usize, seed: u64) -> Vec<Vec<u32>> {
+    (0..b)
+        .map(|s| {
+            let mut rng = kenny::rng::SplitMix64::for_name(seed, &format!("m2.bench.{s}"));
+            (0..len)
+                .map(|_| (rng.next_u64() % vocab as u64) as u32)
+                .collect()
+        })
+        .collect()
+}
+
+#[test]
+fn batch_sweep_localhost() {
+    let Some(dir) = std::env::var_os("KENNY_MODEL_DIR") else {
+        eprintln!("KENNY_MODEL_DIR unset — skipping M2 localhost batch sweep");
+        return;
+    };
+    let model_dir = PathBuf::from(dir);
+
+    // fp8 carve of the real model (shared with the S7 harness; re-runs dedup-skip
+    // so a warm carve is cheap).
+    let carved = Path::new(env!("CARGO_TARGET_TMPDIR")).join("real-carve-fp8");
+    std::fs::create_dir_all(&carved).unwrap();
+    let t0 = std::time::Instant::now();
+    let s = carve::run(
+        &model_dir,
+        &Options {
+            out: carved.clone(),
+            model_name: "qwen3-30b-a3b".into(),
+            model_rev: String::new(),
+            dtype: Dtype::Fp8,
+        },
+    )
+    .unwrap();
+    eprintln!(
+        "M2 fp8 carve: {} blobs ({} new bytes, {} dedup) in {:.1?}",
+        s.blobs,
+        s.blob_bytes,
+        s.dedup_skipped,
+        t0.elapsed()
+    );
+
+    let manifest = Manifest::load(&carved.join(manifest::FILE_NAME)).unwrap();
+    let hidden = manifest.model.hidden as usize;
+    let moe_layers = manifest.model.moe_layers as u64;
+
+    let cfg = Config::default();
+    let t_load = std::time::Instant::now();
+    let spine = Spine::load(&model_dir, &manifest, cfg).unwrap();
+    eprintln!(
+        "M2 spine load (always-on tensors): {:.1?}",
+        t_load.elapsed()
+    );
+
+    // Short prompt + tiny max_new bound the wall time: the spine-sim forward is a
+    // CPU-bound dense pure-Rust f32 pass, and a batched step runs B of them, so
+    // per-step cost scales ~linearly in B (this is exactly what the sweep shows).
+    let prompt_len = 2usize;
+    let max_new = 2usize;
+    let vocab = spine.vocab();
+    let k = spine.experts_per_step() as u64;
+    let elem = 1u64; // fp8: one byte per element
+    let payload = hidden as u64 * elem;
+    // forwards per stream = prompt_len primes + (max_new - 1) generations.
+    let forwards = (prompt_len + max_new - 1) as u64;
+
+    eprintln!(
+        "M2 sweep: prompt {prompt_len} tok, max_new {max_new}, top-k {k}, {moe_layers} MoE layers, \
+         fp8 blobs + fp8 wire, loopback"
+    );
+    eprintln!("B\ttok/s\tstep_median\tstep_p99\tup_B\tdown_B\tup/tok\tdown/tok");
+
+    for b in [1usize, 2, 4, 8, 16, 32, 64, 128] {
+        let prompts = bench_prompts(b, prompt_len, vocab, 42);
+        let refs: Vec<&[u32]> = prompts.iter().map(Vec::as_slice).collect();
+        let (_outs, stats) = via_node_batch(&spine, &carved, "fp8", &refs, max_new, &[]);
+
+        // Exact per-direction wire accounting — the sweep double-checks that
+        // batching adds NO new wire shape (ADR-0023): D independent dispatch/gather
+        // pairs, D = B × forwards × moe_layers, all experts present (answered == k).
+        let d = b as u64 * forwards * moe_layers;
+        let up = HANDSHAKE_LEN as u64 + d * (DISPATCH_HEADER_LEN as u64 + payload + 2 * k);
+        let down =
+            d * (GATHER_HEADER_LEN as u64 + GATHER_RECORD_HEADER_LEN as u64 * k + payload * k);
+        assert_eq!(stats.wire_up, up, "B={b}: up bytes reconcile to framing");
+        assert_eq!(
+            stats.wire_down, down,
+            "B={b}: down bytes reconcile to framing"
+        );
+        assert_eq!(
+            stats.dispatches, d,
+            "B={b}: dispatch count = B × forwards × moe_layers"
+        );
+        assert_eq!(
+            stats.generated_tokens,
+            b * max_new,
+            "B={b}: aggregate generated tokens"
+        );
+
+        let secs = stats.elapsed.as_secs_f64();
+        let tok_s = stats.generated_tokens as f64 / secs;
+        let (median, p99) = stats.latency_median_p99();
+        let up_tok = stats.wire_up as f64 / stats.generated_tokens as f64;
+        let down_tok = stats.wire_down as f64 / stats.generated_tokens as f64;
+        eprintln!(
+            "{b}\t{tok_s:.3}\t{median:.2?}\t{p99:.2?}\t{}\t{}\t{up_tok:.0}\t{down_tok:.0}",
+            stats.wire_up, stats.wire_down
+        );
+    }
+}
