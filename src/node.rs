@@ -212,6 +212,38 @@ impl Node {
         self.index.remove(&(layer, expert)).is_some()
     }
 
+    /// Re-insert an expert into this node's index — the symmetric inverse of
+    /// `drop_expert` (ADR-0024), the LIVE-migration primitive M5.A (ADR-0009)
+    /// needs: a re-place that hands this node a `(layer, expert)` it had shed
+    /// restores coverage WITHOUT a process restart, because the blob is already
+    /// on disk in the carve dir (its CID comes straight from the carve's
+    /// manifest, the same source `load` indexes from). Only an expert this
+    /// carve actually holds can be added — one the manifest does not list is
+    /// rejected loudly (a node cannot serve bytes it has never carved). Returns
+    /// whether the entry was newly inserted (`false` if already held — an
+    /// idempotent no-op, the mirror of `drop_expert`'s "was it present"). The
+    /// serve loop and the wire stay untouched: a re-added expert simply stops
+    /// answering `not-held`, and its `y` is bit-identical to before it was
+    /// dropped (the CID, and therefore the blob and the forward, are the same).
+    pub fn add_expert(&mut self, layer: u16, expert: u16) -> Result<bool> {
+        if self.index.contains_key(&(layer, expert)) {
+            return Ok(false);
+        }
+        let cid = self
+            .manifest
+            .experts
+            .iter()
+            .find(|e| e.layer == layer && e.expert == expert)
+            .map(|e| e.cid.clone())
+            .ok_or_else(|| {
+                Error::parse(format!(
+                    "node: cannot add (layer {layer}, expert {expert}) — not in this carve's manifest"
+                ))
+            })?;
+        self.index.insert((layer, expert), cid);
+        Ok(true)
+    }
+
     /// Restrict this node to a SUBSET of the carve's experts (the `--hold` /
     /// `--shard` knob, ADR-0009 / ADR-0024): every expert the subset excludes is
     /// dropped from the index via `drop_expert`, so the node simply answers
@@ -502,6 +534,62 @@ mod tests {
         assert_eq!(
             union, want,
             "the shards must cover every expert exactly once"
+        );
+    }
+
+    #[test]
+    fn add_expert_reinsert_answers_bit_exact() {
+        // M5.A live-migration lock: a node that DROPS an expert answers it
+        // `not-held`; a node that ADDS it back answers it BIT-IDENTICALLY to
+        // before the drop (same CID → same blob → same forward → same encoded
+        // y). This is what makes "migration = re-carve subsets + --hold change"
+        // a live index mutation, not a process restart.
+        let out = carved(&tmp("add-expert"));
+        let manifest = Manifest::load(&out.join(manifest::FILE_NAME)).unwrap();
+        let hidden = manifest.model.hidden as usize;
+        let x_raw: Vec<f32> = (0..hidden).map(|k| (k as f32) * 0.2 - 0.7).collect();
+
+        for codec in [&Fp8Codec as &dyn WireCodec, &Bf16Codec as &dyn WireCodec] {
+            let mut xb = Vec::new();
+            codec.encode(&x_raw, &mut xb);
+            let x = codec.decode(&xb).unwrap();
+
+            let mut node = Node::load(&out).unwrap();
+            let want = node
+                .run_local(0, 1, &x, codec)
+                .unwrap()
+                .expect("expert (0,1) is held by a freshly loaded node");
+
+            assert!(node.drop_expert(0, 1), "the expert must have been present");
+            assert!(
+                node.run_local(0, 1, &x, codec).unwrap().is_none(),
+                "a dropped expert answers not-held"
+            );
+
+            assert!(
+                node.add_expert(0, 1).unwrap(),
+                "re-adding a dropped, manifest-listed expert reports a new insert"
+            );
+            let regained = node
+                .run_local(0, 1, &x, codec)
+                .unwrap()
+                .expect("the re-added expert is held again");
+            assert_eq!(
+                regained, want,
+                "a re-added expert answers bit-identically to before the drop"
+            );
+
+            assert!(
+                !node.add_expert(0, 1).unwrap(),
+                "adding an already-held expert is an idempotent no-op"
+            );
+        }
+
+        // An expert this carve never held cannot be conjured onto the node.
+        let mut node = Node::load(&out).unwrap();
+        assert!(
+            node.add_expert(0, 99).is_err(),
+            "adding an expert absent from the manifest is rejected"
         );
     }
 
