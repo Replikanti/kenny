@@ -9,6 +9,7 @@ use crate::carve;
 use crate::diff;
 use crate::error::{Error, Result};
 use crate::fixture;
+use crate::node;
 
 const USAGE: &str = "\
 kenny — distributed MoE expert pool (M0 carve tooling)
@@ -35,6 +36,13 @@ USAGE:
         Recompute y = down(silu(gate.x) * (up.x)) for every expert of one MoE
         layer, from source tensors and from carved blobs, and compare. bf16
         carves must match bit-for-bit; fp8/int8 report max-abs and cosine.
+
+    kenny node --carved <dir> [--listen <addr>]
+        Serve the carve's experts (ADR-0013): load the manifest, then answer
+        dispatch/gather over sync TCP (ADR-0016). Prints `listening <addr>` on
+        stdout — the OS-assigned address, since --listen defaults to
+        127.0.0.1:0 (a fixed port is flaky under concurrency). Experts the node
+        does not hold answer not-held (feeds the spine's renorm, ADR-0008).
 ";
 
 pub fn run(args: &[String]) -> Result<()> {
@@ -46,6 +54,7 @@ pub fn run(args: &[String]) -> Result<()> {
         Some("fixture") => run_fixture(&args[1..]),
         Some("carve") => run_carve(&args[1..]),
         Some("diff") => run_diff(&args[1..]),
+        Some("node") => run_node(&args[1..]),
         Some(other) => Err(Error::usage(format!("unknown command {other:?}"))),
     }
 }
@@ -262,4 +271,24 @@ fn run_diff(args: &[String]) -> Result<()> {
         r.worst_cosine, worst_cos.expert
     );
     Ok(())
+}
+
+fn run_node(args: &[String]) -> Result<()> {
+    let mut carved: Option<PathBuf> = None;
+    // A5: default to an OS-assigned port; a fixed port flakes under CI
+    // concurrency. The bound address is printed on stdout for discovery.
+    let mut listen = String::from("127.0.0.1:0");
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--carved" => carved = Some(PathBuf::from(value(args, &mut i, "--carved")?)),
+            "--listen" => listen = value(args, &mut i, "--listen")?.to_string(),
+            other => {
+                return Err(Error::usage(format!("node: unexpected argument {other:?}")));
+            }
+        }
+        i += 1;
+    }
+    let carved = carved.ok_or_else(|| Error::usage("node: --carved is required"))?;
+    node::serve(&carved, &listen)
 }
