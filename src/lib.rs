@@ -11,6 +11,7 @@ pub mod carve;
 pub mod cli;
 pub mod diff;
 pub mod error;
+pub mod expert;
 pub mod fixture;
 pub mod fp8;
 pub mod json;
