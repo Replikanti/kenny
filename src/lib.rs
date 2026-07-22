@@ -20,5 +20,6 @@ pub mod natsort;
 pub mod quant;
 pub mod rng;
 pub mod safetensors;
+pub mod wire;
 
 pub use error::{Error, Result};
