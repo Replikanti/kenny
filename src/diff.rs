@@ -19,6 +19,7 @@ use std::path::Path;
 
 use crate::blob::{self, Dtype};
 use crate::error::{Error, Result};
+use crate::expert;
 use crate::manifest::Manifest;
 use crate::quant;
 use crate::rng::SplitMix64;
@@ -56,33 +57,6 @@ pub struct DiffReport {
     pub worst_max_abs: f64,
     pub worst_cosine: f64,
     pub per_expert: Vec<ExpertDiff>,
-}
-
-/// `y = down . (silu(gate . x) * (up . x))`; gate/up are [inter, hidden],
-/// down is [hidden, inter], all row-major f32.
-fn forward(gate: &[f32], up: &[f32], down: &[f32], hidden: usize, x: &[f32], y: &mut [f32]) {
-    let inter = gate.len() / hidden;
-    let mut a = vec![0f32; inter];
-    for (ar, (grow, urow)) in a
-        .iter_mut()
-        .zip(gate.chunks_exact(hidden).zip(up.chunks_exact(hidden)))
-    {
-        let mut g = 0f32;
-        let mut u = 0f32;
-        for ((&gw, &uw), &xv) in grow.iter().zip(urow).zip(x) {
-            g += gw * xv;
-            u += uw * xv;
-        }
-        let silu = g / (1.0 + (-g).exp());
-        *ar = silu * u;
-    }
-    for (yr, drow) in y.iter_mut().zip(down.chunks_exact(inter)) {
-        let mut acc = 0f32;
-        for (&dw, &av) in drow.iter().zip(&a) {
-            acc += dw * av;
-        }
-        *yr = acc;
-    }
 }
 
 pub fn run(model_dir: &Path, carved_dir: &Path, opts: &DiffOptions) -> Result<DiffReport> {
@@ -177,21 +151,7 @@ pub fn run(model_dir: &Path, carved_dir: &Path, opts: &DiffOptions) -> Result<Di
                 entry.layer, entry.expert
             )));
         }
-        let (cg, cu, cd) = match d.header.dtype {
-            Dtype::Bf16 => (
-                quant::bf16_to_f32_vec(d.gate)?,
-                quant::bf16_to_f32_vec(d.up)?,
-                quant::bf16_to_f32_vec(d.down)?,
-            ),
-            dt => {
-                let (sg, su, sd) = d.scale_parts()?;
-                (
-                    quant::dequantize_matrix(dt, sg, d.gate, inter, hidden)?,
-                    quant::dequantize_matrix(dt, su, d.up, inter, hidden)?,
-                    quant::dequantize_matrix(dt, sd, d.down, hidden, inter)?,
-                )
-            }
-        };
+        let (cg, cu, cd) = expert::reconstruct(&d)?;
         let rg = source_matrix(entry.layer, entry.expert, "gate_proj", inter, hidden)?;
         let ru = source_matrix(entry.layer, entry.expert, "up_proj", inter, hidden)?;
         let rd = source_matrix(entry.layer, entry.expert, "down_proj", hidden, inter)?;
@@ -201,8 +161,8 @@ pub fn run(model_dir: &Path, carved_dir: &Path, opts: &DiffOptions) -> Result<Di
         let mut y_ref = vec![0f32; hidden];
         let mut y_car = vec![0f32; hidden];
         for x in &xs {
-            forward(&rg, &ru, &rd, hidden, x, &mut y_ref);
-            forward(&cg, &cu, &cd, hidden, x, &mut y_car);
+            expert::forward(&rg, &ru, &rd, hidden, x, &mut y_ref);
+            expert::forward(&cg, &cu, &cd, hidden, x, &mut y_car);
             for (&a, &b) in y_ref.iter().zip(&y_car) {
                 if a.to_bits() != b.to_bits() {
                     bitwise_exact = false;
