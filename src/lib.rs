@@ -17,6 +17,7 @@ pub mod fp8;
 pub mod json;
 pub mod manifest;
 pub mod natsort;
+pub mod node;
 pub mod quant;
 pub mod rng;
 pub mod safetensors;
