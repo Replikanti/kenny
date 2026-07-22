@@ -371,6 +371,13 @@ pub trait Dispatcher {
     fn wire_bytes(&self) -> (u64, u64) {
         (0, 0)
     }
+
+    /// Layers dropped to a fired per-layer timeout over this dispatcher's life
+    /// (ADR-0010); `0` for dispatchers without a deadline. Read into `GenStats`
+    /// at the end of a run, like `wire_bytes`.
+    fn layer_timeouts(&self) -> u64 {
+        0
+    }
 }
 
 /// In-process dispatch: runs experts through a `Node` loaded from the carve,
@@ -424,6 +431,15 @@ pub struct NodeDispatch {
     /// `hidden * codec.elem_bytes()` — the only legal activation / answered-y
     /// size, checked by the transport before it allocates.
     elem_len: usize,
+    /// The node address + manifest identity, kept so a timed-out (desynced)
+    /// connection can be torn down and reconnected (see `with_layer_timeout`).
+    addr: String,
+    identity: [u8; 32],
+    /// Per-layer receive deadline (ADR-0010). `None` (the default) is the exact
+    /// current behavior, byte-for-byte — no `set_read_timeout`, no reconnect.
+    layer_timeout: Option<Duration>,
+    /// Layers dropped to a fired timeout over this connection's life.
+    layer_timeouts: u64,
 }
 
 impl NodeDispatch {
@@ -436,6 +452,15 @@ impl NodeDispatch {
     ) -> Result<NodeDispatch> {
         let stream = TcpStream::connect(addr)
             .map_err(|e| Error::parse(format!("spine: cannot connect to node {addr}: {e}")))?;
+        // TCP_NODELAY so the composed-wire batch pipeline (ADR-0023) actually
+        // amortizes the per-layer RTT barrier: with Nagle on, the spine's
+        // back-to-back small dispatch writes serialize behind each other's ACK
+        // and step time grows ∝ B (the measured M3 finding). Still ADR-0016
+        // option (a) sync TCP — a per-socket hint, not an async runtime. The
+        // wire bytes are unchanged, so goldens + GOLDEN_SPINE_TOKENS are unaffected.
+        stream
+            .set_nodelay(true)
+            .map_err(|e| Error::parse(format!("spine: cannot set TCP_NODELAY on {addr}: {e}")))?;
         let mut transport = Transport::new(stream);
         transport.send_handshake(&Handshake::new(codec.as_ref(), identity))?;
         let elem_len = hidden * codec.elem_bytes();
@@ -443,7 +468,118 @@ impl NodeDispatch {
             transport,
             codec,
             elem_len,
+            addr: addr.to_string(),
+            identity,
+            layer_timeout: None,
+            layer_timeouts: 0,
         })
+    }
+
+    /// Set a per-layer receive deadline (ADR-0010): each `recv_gather` waits at
+    /// most `timeout`; on expiry the layer's experts go `NotHeld` (feeding the
+    /// ADR-0008 renorm), the timed-out — and now desynced, a stale gather is
+    /// still in flight — connection is torn down + reconnected, and
+    /// `layer_timeouts` is incremented. `None` (the `connect` default) is the
+    /// exact current behavior, bit-for-bit. Single-node caveat: one node holding
+    /// all k experts drops the WHOLE layer on a timeout (degenerate renorm) — so
+    /// this bounds p99 and measures the timeout RATE; the graceful multi-node
+    /// renorm is the PR3 hedge fixture.
+    pub fn with_layer_timeout(mut self, timeout: Duration) -> NodeDispatch {
+        // Applied to the live stream now; `reconnect` re-applies it to each
+        // fresh stream. Best-effort: a set_read_timeout failure on a just-connected
+        // TCP socket is not a real condition, and the field still records intent.
+        let _ = self.transport.get_ref().set_read_timeout(Some(timeout));
+        self.layer_timeout = Some(timeout);
+        self
+    }
+
+    /// Tear down the desynced connection after a timeout and open a fresh one:
+    /// reconnect, re-hint TCP_NODELAY + the read deadline, re-handshake. Nodes are
+    /// stateless (MANIFESTO §2), so a new connection loses nothing — it simply
+    /// resyncs the stream past the stale in-flight gather. The wire counters carry
+    /// across so BENCH still totals every byte (including each re-handshake).
+    fn reconnect(&mut self) -> Result<()> {
+        let stream = TcpStream::connect(&self.addr).map_err(|e| {
+            Error::parse(format!(
+                "spine: cannot reconnect to node {}: {e}",
+                self.addr
+            ))
+        })?;
+        stream.set_nodelay(true).map_err(|e| {
+            Error::parse(format!("spine: cannot set TCP_NODELAY on reconnect: {e}"))
+        })?;
+        if let Some(t) = self.layer_timeout {
+            stream.set_read_timeout(Some(t)).map_err(|e| {
+                Error::parse(format!("spine: cannot set read timeout on reconnect: {e}"))
+            })?;
+        }
+        let (up, down) = (self.transport.up, self.transport.down);
+        let mut transport = Transport::new(stream);
+        transport.up = up;
+        transport.down = down;
+        transport.send_handshake(&Handshake::new(self.codec.as_ref(), self.identity))?;
+        self.transport = transport;
+        Ok(())
+    }
+
+    /// Receive one gather under the per-layer deadline (single-stream path): a
+    /// timed-out read counts the layer, reconnects the desynced stream, and
+    /// answers every requested expert `NotHeld` (→ mix_moe's ADR-0008 renorm).
+    fn recv_gather_or_timeout(&mut self, experts: &[u16]) -> Result<Vec<Option<Vec<f32>>>> {
+        match self.transport.recv_gather(self.elem_len) {
+            Ok(gather) => Self::decode_gather(self.codec.as_ref(), experts, &gather),
+            Err(e) if e.is_timeout() => {
+                self.layer_timeouts += 1;
+                self.reconnect()?;
+                Ok(vec![None; experts.len()])
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Batched dispatch under the per-layer deadline. Because one lost segment
+    /// head-of-line-blocks every later gather on the shared stream, a timeout on
+    /// stream `i` means `i..B` are all still stuck behind it — so they all go
+    /// `NotHeld` and the layer reconnects ONCE (a single degenerate whole-layer
+    /// drop, the honest single-node HOL number). Streams answered before the
+    /// timeout keep their real `y`. The fixture frames are tiny, so send-all-
+    /// then-read is deadlock-free here; the default (no-timeout) path keeps the
+    /// writer-thread pipeline untouched (its bit-exact regression lock).
+    fn dispatch_batch_timed(
+        &mut self,
+        layer: u16,
+        items: &[(&[f32], &[u16])],
+    ) -> Result<Vec<Vec<Option<Vec<f32>>>>> {
+        for &(x, experts) in items {
+            let mut xb = Vec::with_capacity(self.elem_len);
+            self.codec.encode(x, &mut xb);
+            self.transport.send_dispatch(&Dispatch {
+                layer,
+                x: xb,
+                experts: experts.to_vec(),
+            })?;
+        }
+        let mut out = Vec::with_capacity(items.len());
+        let mut timed_out = false;
+        for &(_x, experts) in items {
+            if timed_out {
+                out.push(vec![None; experts.len()]);
+                continue;
+            }
+            match self.transport.recv_gather(self.elem_len) {
+                Ok(gather) => out.push(Self::decode_gather(self.codec.as_ref(), experts, &gather)?),
+                Err(e) if e.is_timeout() => {
+                    timed_out = true;
+                    out.push(vec![None; experts.len()]);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        if timed_out {
+            self.layer_timeouts += 1;
+            self.reconnect()?;
+        }
+        Ok(out)
     }
 }
 
@@ -496,6 +632,9 @@ impl Dispatcher for NodeDispatch {
             x: xb,
             experts: experts.to_vec(),
         })?;
+        if self.layer_timeout.is_some() {
+            return self.recv_gather_or_timeout(experts);
+        }
         let gather = self.transport.recv_gather(self.elem_len)?;
         Self::decode_gather(self.codec.as_ref(), experts, &gather)
     }
@@ -515,6 +654,12 @@ impl Dispatcher for NodeDispatch {
         layer: u16,
         items: &[(&[f32], &[u16])],
     ) -> Result<Vec<Vec<Option<Vec<f32>>>>> {
+        // With a per-layer deadline, take the timeout-aware send-all-then-read
+        // path (reconnects on a straggler). The default `None` keeps the exact
+        // writer-thread pipeline below, byte-for-byte (bit-exact regression lock).
+        if self.layer_timeout.is_some() {
+            return self.dispatch_batch_timed(layer, items);
+        }
         if items.len() <= 1 {
             return items
                 .iter()
@@ -589,6 +734,10 @@ impl Dispatcher for NodeDispatch {
     fn wire_bytes(&self) -> (u64, u64) {
         (self.transport.up, self.transport.down)
     }
+
+    fn layer_timeouts(&self) -> u64 {
+        self.layer_timeouts
+    }
 }
 
 // -------------------------------------------------------------------------
@@ -621,6 +770,10 @@ pub struct GenStats {
     /// MoE steps where at least one selected expert did not answer (renorm ran),
     /// counted PER STREAM (a batched step can renorm some streams and not others).
     pub renorm_steps: u64,
+    /// Layers dropped to a fired per-layer timeout (ADR-0010) over the run — the
+    /// straggler count behind the timeout RATE BENCH reports. `0` unless a
+    /// `NodeDispatch::with_layer_timeout` deadline was set.
+    pub layer_timeouts: u64,
     pub wire_up: u64,
     pub wire_down: u64,
     pub elapsed: Duration,
@@ -784,6 +937,7 @@ impl Spine {
         let (up, down) = dispatcher.wire_bytes();
         stats.wire_up = up;
         stats.wire_down = down;
+        stats.layer_timeouts = dispatcher.layer_timeouts();
         Ok((tokens, stats))
     }
 

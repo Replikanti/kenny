@@ -12,10 +12,13 @@
 //! and lives in a later PR (S7).
 
 use std::io::{BufRead, BufReader};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use std::time::Duration;
 
 use kenny::blob::Dtype;
 use kenny::carve::{self, Options};
@@ -132,6 +135,10 @@ fn via_node_batch(
             assert!(node.drop_expert(l, e), "expert to drop must exist");
         }
         let (sock, _) = listener.accept().unwrap();
+        // TCP_NODELAY on the node's accepted socket too — the M3 measurements run
+        // through this harness, so its back-to-back gather writes must not stall
+        // behind Nagle either (mirrors src/node.rs serve() + NodeDispatch::connect).
+        sock.set_nodelay(true).unwrap();
         node.serve_connection(sock).unwrap()
     });
 
@@ -141,6 +148,62 @@ fn via_node_batch(
         .generate_batch(&mut dispatch, prompts, tokens)
         .unwrap();
     drop(dispatch); // hang up so the node's serve loop ends
+    server.join().unwrap();
+    out
+}
+
+/// Timeout-aware twin of `via_node_batch`: applies an optional per-layer deadline
+/// (ADR-0010) to the `NodeDispatch`, and — because a fired timeout tears down +
+/// reconnects the desynced connection — serves connections in a LOOP (the plain
+/// harness accepts exactly one). The loop stops once the run is done and a wake
+/// connection unblocks the final `accept`. `timeout = None` reduces to the plain
+/// single-connection behavior (no reconnect), so it is a clean drop-in.
+fn via_node_batch_timed(
+    spine: &Spine,
+    carved: &Path,
+    which: &str,
+    prompts: &[&[u32]],
+    tokens: usize,
+    timeout: Option<Duration>,
+) -> (Vec<Vec<u32>>, spine::GenStats) {
+    let manifest = Manifest::load(&carved.join(manifest::FILE_NAME)).unwrap();
+    let identity = *blake3::hash(&manifest.canonical_bytes()).as_bytes();
+    let hidden = manifest.model.hidden as usize;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let carved_p = carved.to_path_buf();
+    let done = Arc::new(AtomicBool::new(false));
+    let done_srv = done.clone();
+    let server = thread::spawn(move || {
+        // The node is stateless, so one Node serves every (re)connection.
+        let mut node = Node::load(&carved_p).unwrap();
+        for stream in listener.incoming() {
+            let sock = match stream {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            if done_srv.load(Ordering::SeqCst) {
+                break; // the wake connection after the run finished
+            }
+            sock.set_nodelay(true).unwrap();
+            // One connection's session ends when the spine hangs up (drop or a
+            // timeout reconnect); a reset mid-gather on a timeout is expected, so
+            // the per-connection result is ignored and the loop accepts the next.
+            let _ = node.serve_connection(sock);
+        }
+    });
+
+    let mut dispatch =
+        NodeDispatch::connect(&addr.to_string(), make_codec(which), identity, hidden).unwrap();
+    if let Some(t) = timeout {
+        dispatch = dispatch.with_layer_timeout(t);
+    }
+    let out = spine
+        .generate_batch(&mut dispatch, prompts, tokens)
+        .unwrap();
+    drop(dispatch); // hang up the final connection
+    done.store(true, Ordering::SeqCst);
+    let _ = TcpStream::connect(addr); // wake the server's pending accept so it exits
     server.join().unwrap();
     out
 }
@@ -168,6 +231,7 @@ fn via_node(
             assert!(node.drop_expert(l, e), "expert to drop must exist");
         }
         let (sock, _) = listener.accept().unwrap();
+        sock.set_nodelay(true).unwrap();
         node.serve_connection(sock).unwrap()
     });
 
@@ -507,6 +571,43 @@ fn golden_token_sequence_is_stable() {
         out, GOLDEN_SPINE_TOKENS,
         "spine forward drifted; if intentional, re-baseline this REGRESSION LOCK"
     );
+}
+
+/// REGRESSION LOCK (CI-runnable, no netns): the per-layer timeout is OPT-IN, so a
+/// `NodeDispatch` with it DISABLED (the `connect` default) must be bit-for-bit the
+/// plain node path — same tokens AND same wire bytes. This guards that merely
+/// adding the timeout mechanism (+ the reconnect plumbing + TCP_NODELAY) did not
+/// perturb the numeric or wire path. The ENABLED-timeout behavior needs induced
+/// loss to fire and lives netns-gated in `netem_loss_hol`: with no loss a large
+/// deadline never trips, but asserting that in CI would race the scheduler, so the
+/// deterministic lock is on the disabled default.
+#[test]
+fn timeout_disabled_equals_node() {
+    let root = tmp("timeout-disabled");
+    let (model, carved) = fixture_and_carve(&root);
+    let manifest = Manifest::load(&carved.join(manifest::FILE_NAME)).unwrap();
+    let hidden = manifest.model.hidden as usize;
+    let spine = Spine::load(&model, &manifest, config(hidden, 2)).unwrap();
+    let prompts: Vec<&[u32]> = vec![&[1, 2, 3], &[3, 2, 1], &[2, 3, 1]];
+
+    for which in ["fp8", "bf16"] {
+        let (plain, plain_stats) = via_node_batch(&spine, &carved, which, &prompts, 6, &[]);
+        let (default_to, to_stats) =
+            via_node_batch_timed(&spine, &carved, which, &prompts, 6, None);
+        assert_eq!(
+            plain, default_to,
+            "codec {which}: timeout-disabled dispatch must equal the plain node path"
+        );
+        assert_eq!(
+            to_stats.layer_timeouts, 0,
+            "codec {which}: no timeout can fire when the deadline is unset"
+        );
+        assert_eq!(
+            (plain_stats.wire_up, plain_stats.wire_down),
+            (to_stats.wire_up, to_stats.wire_down),
+            "codec {which}: identical wire bytes (no reconnect, no re-handshake)"
+        );
+    }
 }
 
 /// The literal "two real processes over localhost" gate: spawn `kenny node`,
@@ -1083,5 +1184,98 @@ fn netem_real_model_anchor(model_dir: &Path, rtt_ms: u64, predicted_floor_ms: u6
             "{b}\t{median:.3?}\t{p99:.3?}\t{}\t{}",
             stats.wire_up, stats.wire_down
         );
+    }
+}
+
+// -------------------------------------------------------------------------
+// M3 — loss / head-of-line (HOL) matrix (ADR-0016) under the per-layer timeout
+// (ADR-0010). The 48-layer compute≈0 fixture at B∈{16,64}, at whatever loss the
+// netns qdisc applies (KENNY_NETEM_LOSS_PCT labels it), with the timeout OFF vs
+// ON, reporting per-step median/p99 + the timeout rate. netns-gated exactly like
+// netem_amortization; `tools/netem-bench.sh --loss-hol` sweeps the loss values by
+// reinstalling the netem qdisc and re-running this test once per L.
+// -------------------------------------------------------------------------
+
+#[test]
+fn netem_loss_hol() {
+    let Some(rtt_os) = std::env::var_os("KENNY_NETEM_RTT_MS") else {
+        eprintln!(
+            "KENNY_NETEM_RTT_MS unset — skipping M3 netem loss/HOL \
+             (run via tools/netem-bench.sh --loss-hol)"
+        );
+        return;
+    };
+    let rtt_ms: u64 = rtt_os
+        .to_string_lossy()
+        .parse()
+        .expect("KENNY_NETEM_RTT_MS must be an integer number of milliseconds");
+    // Loss is a qdisc property (set by the shell); this label is for the report.
+    let loss_pct = std::env::var("KENNY_NETEM_LOSS_PCT").unwrap_or_else(|_| "0".into());
+
+    let root = tmp("netem-loss-hol");
+    // Same 48-barrier compute≈0 fixture as netem_amortization: transport HOL is
+    // compute-independent, so the fixture gives a populated p99 tail cheaply.
+    let params = Params {
+        layers: 48,
+        experts: 8,
+        hidden: 8,
+        inter: 4,
+        vocab: 32,
+        seed: 42,
+    };
+    let model = root.join("model");
+    fixture::generate(&params, &model).unwrap();
+    let carved = root.join("carved");
+    carve::run(
+        &model,
+        &Options {
+            out: carved.clone(),
+            model_name: "netem-fixture".into(),
+            model_rev: String::new(),
+            dtype: Dtype::Fp8,
+        },
+    )
+    .unwrap();
+
+    let manifest = Manifest::load(&carved.join(manifest::FILE_NAME)).unwrap();
+    let hidden = manifest.model.hidden as usize;
+    let moe_layers = manifest.model.moe_layers as u64;
+    let spine = Spine::load(&model, &manifest, config(hidden, 2)).unwrap();
+
+    let prompt_len = 2usize;
+    // Bounded wall-clock: with the timeout OFF under loss, each layer can add a
+    // full TCP RTO, so a step can stretch to seconds — 30 steps still gives a
+    // ~31-sample tail for a coarse p99 while keeping the matrix under budget.
+    let steps = 30usize;
+    let vocab = spine.vocab();
+    // Per-layer deadline = 3× the loss-free RTT: a healthy gather (~RTT) clears
+    // it; a lost/retransmitted one (TCP RTO ≫ RTT) trips it. p99-bounding knob.
+    let timeout = Duration::from_millis((rtt_ms * 3).max(1));
+
+    eprintln!(
+        "M3 loss/HOL: {moe_layers} MoE layers, RTT {rtt_ms} ms, loss {loss_pct}%, \
+         per-layer timeout {} ms, {steps} steps, fp8 wire, netem loopback",
+        timeout.as_millis()
+    );
+    eprintln!("B\ttimeout\tstep_median\tstep_p99\ttimeout_layers\ttimeout_rate\trenorm_steps");
+    for b in [16usize, 64] {
+        let prompts = bench_prompts(b, prompt_len, vocab, 42);
+        let refs: Vec<&[u32]> = prompts.iter().map(Vec::as_slice).collect();
+        for (label, to) in [("off", None), ("on", Some(timeout))] {
+            let (_outs, stats) = via_node_batch_timed(&spine, &carved, "fp8", &refs, steps, to);
+            let (median, p99) = stats.latency_median_p99();
+            // One dispatch_batch per MoE layer per batched step is the timeout
+            // denominator (a fired timeout drops one whole layer-step).
+            let layer_steps = stats.per_forward.len() as u64 * moe_layers;
+            let rate = if layer_steps > 0 {
+                stats.layer_timeouts as f64 / layer_steps as f64
+            } else {
+                0.0
+            };
+            eprintln!(
+                "{b}\t{label}\t{median:.2?}\t{p99:.2?}\t{}\t{rate:.4}\t{}",
+                stats.layer_timeouts, stats.renorm_steps
+            );
+        }
     }
 }

@@ -52,7 +52,7 @@
 //!           then y_len bytes of encoded y iff status == ok (none for not-held)
 //! ```
 
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 
 use crate::bf16;
 use crate::error::{Error, Result};
@@ -499,11 +499,22 @@ impl<S: Read + Write> Transport<S> {
     }
 
     fn read_counted(&mut self, buf: &mut [u8]) -> Result<()> {
-        self.stream
-            .read_exact(buf)
-            .map_err(|e| Error::parse(format!("wire: read failed: {e}")))?;
-        self.down += buf.len() as u64;
-        Ok(())
+        match self.stream.read_exact(buf) {
+            Ok(()) => {
+                self.down += buf.len() as u64;
+                Ok(())
+            }
+            // A read deadline (set via `TcpStream::set_read_timeout`, off by
+            // default) surfaces as its own error so the per-layer timeout
+            // (ADR-0010) can tell a straggler from a real fault; `WouldBlock`
+            // (Unix) and `TimedOut` (Windows) both mean the deadline elapsed.
+            // The bytes consumed before the deadline are dropped — the caller
+            // reconnects on a timeout, so the desynced stream is discarded.
+            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                Err(Error::timeout())
+            }
+            Err(e) => Err(Error::parse(format!("wire: read failed: {e}"))),
+        }
     }
 
     pub fn send_handshake(&mut self, h: &Handshake) -> Result<()> {

@@ -12,7 +12,7 @@
 # second-box LAN — the real-LAN validation stays issue #4.
 #
 # Usage:
-#   tools/netem-bench.sh [--rtt MS] [--loss PCT] [--jitter MS]
+#   tools/netem-bench.sh [--rtt MS] [--loss PCT] [--jitter MS] [--loss-hol]
 #
 # Fixture arm (model-free, ~10 min): amortization B-sweep at the given RTT.
 #   tools/netem-bench.sh --rtt 30
@@ -20,6 +20,9 @@
 # RTT ms in the SAME netns so BENCH reports Δt_step = t_step(RTT) − t_step(0),
 # isolating the RTT term from any per-namespace overhead.
 #   KENNY_MODEL_DIR=<model_dir> tools/netem-bench.sh --rtt 30
+# Loss / head-of-line (HOL) matrix (model-free): the per-layer timeout OFF vs ON
+# under a loss sweep L in {0, 0.5, 1, 2}%, one netem qdisc + test run per L.
+#   tools/netem-bench.sh --rtt 30 --loss-hol
 #
 # If unprivileged netns is unavailable (e.g. CI), prints a skip and exits 0 — a
 # plain `cargo test` never touches netem (the Rust arm is KENNY_NETEM_RTT_MS-gated).
@@ -28,13 +31,15 @@ set -eu
 rtt=30
 loss=
 jitter=
+loss_hol=
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --rtt) rtt=$2; shift 2 ;;
     --loss) loss=$2; shift 2 ;;
     --jitter) jitter=$2; shift 2 ;;
-    -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
+    --loss-hol) loss_hol=1; shift ;;
+    -h|--help) sed -n '2,29p' "$0"; exit 0 ;;
     *) echo "netem-bench: unknown argument '$1'" >&2; exit 2 ;;
   esac
 done
@@ -51,38 +56,47 @@ cd "$(dirname "$0")/.."
 # and a build failure should surface without the netns/netem noise.
 cargo test --release --test dispatch --no-run >/dev/null
 
-# run_one RTT_MS: bring lo up, install a netem qdisc emulating an RTT_MS round
-# trip (half each direction on lo egress — a loopback packet is delayed once per
-# direction), export the gate + scenario, and run the bench inside the namespace.
-# Loss/jitter attach only when RTT_MS > 0 (jitter needs a base delay; the 0 ms
-# control measures the bare netns overhead so Δt_step isolates the RTT term).
+# run_one RTT_MS TEST LOSS_PCT: bring lo up, install a netem qdisc emulating an
+# RTT_MS round trip (half each direction on lo egress — a loopback packet is
+# delayed once per direction), export the gate + scenario, and run TEST inside the
+# namespace. Loss/jitter attach only when RTT_MS > 0 (jitter needs a base delay;
+# the 0 ms control measures the bare netns overhead so Δt_step isolates the RTT).
 run_one() {
   _rtt=$1
+  _test=$2
+  _loss=$3
   _half=$((_rtt / 2))
   _netem="delay ${_half}ms"
   if [ "$_rtt" -gt 0 ]; then
     [ -n "$jitter" ] && _netem="$_netem ${jitter}ms"
-    [ -n "$loss" ] && _netem="$_netem loss ${loss}%"
+    [ -n "$_loss" ] && [ "$_loss" != "0" ] && _netem="$_netem loss ${_loss}%"
   fi
-  echo "=== netem: lo ${_netem} (RTT ${_rtt} ms) ==="
+  echo "=== netem: lo ${_netem} (RTT ${_rtt} ms, test ${_test}) ==="
   KENNY_NETEM_RTT_MS=$_rtt \
-  KENNY_NETEM_LOSS_PCT=${loss:-0} \
+  KENNY_NETEM_LOSS_PCT=${_loss:-0} \
   KENNY_NETEM_JITTER_MS=${jitter:-0} \
   NETEM_QDISC="$_netem" \
+  NETEM_TEST="$_test" \
   unshare -rn sh -c '
     set -e
     ip link set lo up
     tc qdisc add dev lo root netem $NETEM_QDISC
-    exec cargo test --release --test dispatch netem_amortization -- --nocapture --test-threads=1
+    exec cargo test --release --test dispatch $NETEM_TEST -- --nocapture --test-threads=1
   '
 }
 
-if [ -n "${KENNY_MODEL_DIR:-}" ]; then
+if [ -n "$loss_hol" ]; then
+  # Loss / HOL matrix: one netem qdisc + netem_loss_hol run per loss value; the
+  # test sweeps B in {16,64} and the per-layer timeout OFF/ON at each L.
+  for L in 0 0.5 1 2; do
+    run_one "$rtt" netem_loss_hol "$L"
+  done
+elif [ -n "${KENNY_MODEL_DIR:-}" ]; then
   # Real-model anchor: control (0 ms) then the RTT run, one netns each.
-  run_one 0
-  run_one "$rtt"
+  run_one 0 netem_amortization "$loss"
+  run_one "$rtt" netem_amortization "$loss"
 else
   # Fixture arm: a single RTT run carries the amortization B-sweep (the M2
   # loopback line is the RTT≈0 contrast — BENCH.md).
-  run_one "$rtt"
+  run_one "$rtt" netem_amortization "$loss"
 fi

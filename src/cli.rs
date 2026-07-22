@@ -51,7 +51,7 @@ USAGE:
     kenny spine --carved <dir> --model <model_dir> (--node <addr> | --local)
                 [--tokens N] [--prompt id,id,...] [--batch N] [--codec fp8|bf16]
                 [--seed N] [--num-heads N] [--num-kv-heads N] [--head-dim N]
-                [--rope-theta N] [--rms-eps-ppm N] [--top-k N]
+                [--rope-theta N] [--rms-eps-ppm N] [--top-k N] [--layer-timeout-ms N]
         Run the Qwen3-30B-A3B spine-sim (ADR-0020): a pure-Rust dense forward
         whose MoE FFN is dispatched to a node (--node) or run in-process
         (--local). Reads the always-on tensors from <model_dir> by the manifest's
@@ -63,6 +63,9 @@ USAGE:
         default to the Qwen3-30B-A3B card (head-dim 128 != hidden/num-heads;
         rope-theta 10000000; rms-eps-ppm 1 = 1e-6); the fixture (square attention)
         loads only at --num-heads 1 --num-kv-heads 1 --head-dim <hidden>.
+        --layer-timeout-ms N caps each MoE layer's wait on a --node (ADR-0010):
+        a straggler layer is dropped to the renorm (ADR-0008) and the connection
+        reconnected; default off (wait indefinitely, the M1/M2 behavior).
 ";
 
 pub fn run(args: &[String]) -> Result<()> {
@@ -337,6 +340,7 @@ fn run_spine(args: &[String]) -> Result<()> {
     let mut seed = 42u64;
     let mut cfg = Config::default();
     let mut rms_eps_ppm = 1u64; // 1e-6
+    let mut layer_timeout_ms: Option<u64> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -398,6 +402,14 @@ fn run_spine(args: &[String]) -> Result<()> {
                 cfg.top_k =
                     parse_num(value(args, &mut i, "--top-k")?, "--top-k", 1, 1 << 16)? as usize;
             }
+            "--layer-timeout-ms" => {
+                layer_timeout_ms = Some(parse_num(
+                    value(args, &mut i, "--layer-timeout-ms")?,
+                    "--layer-timeout-ms",
+                    1,
+                    1 << 30,
+                )?);
+            }
             other => {
                 return Err(Error::usage(format!(
                     "spine: unexpected argument {other:?}"
@@ -458,9 +470,18 @@ fn run_spine(args: &[String]) -> Result<()> {
     let prompt_refs: Vec<&[u32]> = prompts.iter().map(Vec::as_slice).collect();
 
     let mut dispatcher: Box<dyn spine::Dispatcher> = if local {
+        if layer_timeout_ms.is_some() {
+            return Err(Error::usage(
+                "spine: --layer-timeout-ms applies to --node dispatch, not --local",
+            ));
+        }
         Box::new(LocalDispatch::new(&carved, codec)?)
     } else {
-        Box::new(NodeDispatch::connect(&nodes[0], codec, identity, hidden)?)
+        let mut nd = NodeDispatch::connect(&nodes[0], codec, identity, hidden)?;
+        if let Some(ms) = layer_timeout_ms {
+            nd = nd.with_layer_timeout(std::time::Duration::from_millis(ms));
+        }
+        Box::new(nd)
     };
 
     let (outs, stats) = spine.generate_batch(dispatcher.as_mut(), &prompt_refs, tokens)?;
@@ -504,8 +525,12 @@ fn run_spine(args: &[String]) -> Result<()> {
         println!("tokens:   stream 0 {:?}", outs[0]);
     }
     println!(
-        "dispatch: {} frames, {}/{} experts answered, {} renorm steps",
-        stats.dispatches, stats.experts_answered, stats.experts_requested, stats.renorm_steps
+        "dispatch: {} frames, {}/{} experts answered, {} renorm steps, {} layer timeouts",
+        stats.dispatches,
+        stats.experts_answered,
+        stats.experts_requested,
+        stats.renorm_steps,
+        stats.layer_timeouts
     );
     println!(
         "wire:     up {} B, down {} B",
