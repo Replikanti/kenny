@@ -480,6 +480,23 @@ at B=1) is well under the naïve `sum` of the three nodes' delays × 48 layers,
 because the concurrent fan overlaps them AND placement keeps most layer-steps on
 the fast node — the step is dominated by node 0's 20 ms, not node 2's 100 ms.
 
+**Order-independent (#28).** Phase-2 now gathers each node when ITS OWN answer is
+first readable (a non-consuming `peek`), not in fixed node-index order, so a
+node's per-node p99 is its own round-trip regardless of connect order. Re-running
+with the connect order REVERSED against the delay order
+(`tools/netem-bench.sh --nodes 3 --placement --reverse` — node index 0 = 100 ms,
+index 2 = 20 ms, same bands) still attributes each node its own delay:
+
+| B | node 0 p99 (100 ms) | node 1 p99 (60 ms) | node 2 p99 (20 ms) |
+|---|---|---|---|
+| 1 | 100.9 ms | 62.1 ms | 22.5 ms |
+| 8 | 100.9 ms | 62.4 ms | 23.8 ms |
+
+Before the fix this reversed order reported ~100 ms for ALL three nodes at B=1
+(the two faster nodes inherited the slowest's head-of-line wait). The
+`netem_placement` fixture arm now asserts each node's p99 ≤ `delay + max(15 ms,
+delay/2)` whenever the delays are distinct, so both connect orders are checked.
+
 > **p99 sample-count caveat (bench honesty):** node 0 (hot, contacted almost every
 > layer-step) has a populated tail (~1,400 samples over 31 forwards × 48 layers);
 > the sparse nodes 1/2 accrue only the layer-steps that route their cold-tail
@@ -492,21 +509,27 @@ At real payload/compute scale the per-node time is `netem delay + real fp8
 activation transfer + the node's expert compute` — the netem delay is now the
 small term and the compute on node 0 (5,336 held experts) dominates. `p99` here is
 worst-of-≈2 forwards (a coarse anchor, not a tail — the plan's budget cap).
+**Re-measured post-#28** (order-independent per-node read):
 
 | B | step median | step p99 | wire up / down (B) | node 0 p99 | node 1 p99 | node 2 p99 |
 |---|---|---|---|---|---|---|
-| 1 | 17.89 s | 17.89 s | 364,228 / 1,577,280 | 684 ms | 574 ms | 447 ms |
-| 8 | 103.08 s | 103.08 s | 2,832,560 / 12,617,772 | 2.2 s | 2.2 s | 2.2 s |
+| 1 | 16.67 s | 16.67 s | 364,228 / 1,577,280 | 520 ms | 254 ms | 214 ms |
+| 8 | 104.48 s | 104.48 s | 2,832,560 / 12,617,772 | **2.3 s** | 1.9 s | **558 ms** |
 
 The placed path runs the real model end-to-end across three shaped nodes on the
-existing wire; the per-node times converge at B=8 (all nodes saturated on compute,
-the 20/60/100 ms shaping is a rounding error against seconds of fp8 forward).
-Caveat: per-node latency is read in ascending node-index order after a hoisted
-send, so a fast node read after a slower co-fanned one inherits its head-of-line
-wait — per-node values here are upper bounds, exact only when index order matches
-delay order (the fixture arm) — see #28 for the order-independent read. The
-un-tuned dense forward is the wall-clock (~9 s/forward, the M1/M3 figure);
-forward-perf tuning stays out of scope as in M1–M3.
+existing wire. The per-node times do NOT converge at B=8: node 0 (5,336 held
+experts) is compute-dominated and slowest (p99 2.3 s, median 1.9 s), while the
+far-but-lightly-loaded nodes 1/2 (539 / 269 experts) read BELOW it (node 2 median
+303 ms, p99 558 ms). The earlier "all three nodes ≈ 2.2 s at B=8" reading was the
+#28 head-of-line-homogenization artifact — the two lighter nodes, read only after
+node 0's ~2 s compute drained, inherited its wait — NOT genuine "all nodes
+saturated on compute". With phase 2 now reading each node when its own answer is
+ready (`peek`-for-readiness), each node's per-node latency is its own load again,
+so placement's compute-load spread across the pool is visible instead of masked.
+The wire bytes are unchanged (`WIRE_VERSION` 1, goldens byte-identical) — only the
+read order + recorded timestamp moved. The un-tuned dense forward is the wall-clock
+(~9 s/forward, the M1/M3 figure); forward-perf tuning stays out of scope as in
+M1–M3.
 
 ### Perplexity canary — fp8 vs bf16-source (ADR-0008 corollary / ADR-0018 quality axis)
 

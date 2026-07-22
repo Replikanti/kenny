@@ -11,7 +11,7 @@
 //! in `src/spine.rs`. The real-model two-process run is `KENNY_MODEL_DIR`-gated
 //! and lives in a later PR (S7).
 
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -959,6 +959,164 @@ fn spawn_subset_node_at(
     (addr, handle)
 }
 
+/// A node-side stream wrapper that delays each RESPONSE by `delay`: a read arms a
+/// latch (a dispatch, or its tail, arrived), and the next write consumes the latch
+/// and sleeps `delay` ONCE before the gather goes out — one delay per
+/// dispatch→gather round-trip, robust to partial reads/writes. It shapes the
+/// node's response TIMING without touching the bytes, so the served answer stays
+/// bit-exact (placed ≡ local). This is the in-process analogue of a per-node `tc
+/// netem` band, needing no netns — used by the order-independence CI lock.
+struct LatchedDelay<S> {
+    inner: S,
+    delay: Duration,
+    armed: bool,
+}
+
+impl<S> LatchedDelay<S> {
+    fn new(inner: S, delay: Duration) -> LatchedDelay<S> {
+        LatchedDelay {
+            inner,
+            delay,
+            armed: false,
+        }
+    }
+}
+
+impl<S: Read> Read for LatchedDelay<S> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.armed = true; // a dispatch (or a further chunk of it) arrived
+        }
+        Ok(n)
+    }
+}
+
+impl<S: Write> Write for LatchedDelay<S> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.armed {
+            // The first write after a read is the head of this round's gather:
+            // hold it back by `delay`, then let the whole response flow out.
+            thread::sleep(self.delay);
+            self.armed = false;
+        }
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// `spawn_subset_node_at` whose served RESPONSES are delayed by `delay` via a
+/// `LatchedDelay` wrap of the REAL `node.serve_connection` — an in-process,
+/// no-netns per-node response-latency shaper. Answers stay bit-exact, so a placed
+/// run over these nodes is still `placed ≡ local`; only the per-node timing moves.
+fn spawn_delayed_subset_node_at(
+    carved: &Path,
+    all_experts: &[(u16, u16)],
+    keep: HashSet<(u16, u16)>,
+    done: Arc<AtomicBool>,
+    bind: &str,
+    delay: Duration,
+) -> (SocketAddr, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind(bind).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let carved_p = carved.to_path_buf();
+    let drops: Vec<(u16, u16)> = all_experts
+        .iter()
+        .filter(|k| !keep.contains(k))
+        .copied()
+        .collect();
+    let handle = thread::spawn(move || {
+        let mut node = Node::load(&carved_p).unwrap();
+        for &(l, e) in &drops {
+            node.drop_expert(l, e);
+        }
+        for stream in listener.incoming() {
+            let sock = match stream {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            if done.load(Ordering::SeqCst) {
+                break;
+            }
+            sock.set_nodelay(true).unwrap();
+            let _ = node.serve_connection(LatchedDelay::new(sock, delay));
+        }
+    });
+    (addr, handle)
+}
+
+/// Drive a placed run over EXACTLY two disjoint nodes, node `j` responding
+/// `delays[j]` late (via `spawn_delayed_subset_node_at`), and return the per-node
+/// latency series (indexed by node) captured before the dispatcher is dropped.
+/// The connection order is the node-index order, so swapping `delays` swaps which
+/// node index is the slow responder — the two "connect orders" the #28 lock runs.
+fn run_placed_delayed(
+    spine: &Spine,
+    carved: &Path,
+    prompts: &[&[u32]],
+    tokens: usize,
+    map: PlacementMap,
+    all_experts: &[(u16, u16)],
+    delays: [Duration; 2],
+) -> Vec<Vec<Duration>> {
+    let manifest = Manifest::load(&carved.join(manifest::FILE_NAME)).unwrap();
+    let identity = *blake3::hash(&manifest.canonical_bytes()).as_bytes();
+    let hidden = manifest.model.hidden as usize;
+
+    let mut addrs = Vec::with_capacity(2);
+    let mut dones = Vec::with_capacity(2);
+    let mut handles = Vec::with_capacity(2);
+    for (j, &delay) in delays.iter().enumerate() {
+        let done = Arc::new(AtomicBool::new(false));
+        let keep: HashSet<(u16, u16)> = map.subset_for(j).into_iter().collect();
+        let (addr, handle) = spawn_delayed_subset_node_at(
+            carved,
+            all_experts,
+            keep,
+            done.clone(),
+            "127.0.0.1:0",
+            delay,
+        );
+        addrs.push(addr);
+        dones.push(done);
+        handles.push(handle);
+    }
+    let addr_strs: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
+
+    let mut disp = PlacedDispatch::connect(
+        &addr_strs,
+        || make_codec("fp8"),
+        identity,
+        hidden,
+        map,
+        None,
+    )
+    .unwrap();
+    let (outs, _stats) = spine.generate_batch(&mut disp, prompts, tokens).unwrap();
+    let per_node: Vec<Vec<Duration>> = disp.per_node_latencies().to_vec();
+    drop(disp);
+
+    for done in &dones {
+        done.store(true, Ordering::SeqCst);
+    }
+    for addr in &addrs {
+        let _ = TcpStream::connect(addr);
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    // The served answers are bit-exact regardless of the delay shaping.
+    let (local, _) = via_local_batch(spine, carved, "fp8", prompts, tokens, &[]);
+    assert_eq!(
+        local, outs,
+        "delayed placed run must stay bit-for-bit local (LatchedDelay shapes timing, not bytes)"
+    );
+    per_node
+}
+
 /// Drive B streams through a `PlacedDispatch` over `node_count` localhost nodes,
 /// each holding only its map-assigned subset (drop the complement). Optionally
 /// make one node a BLACK HOLE (drains, never answers) to force the replica-set
@@ -1132,6 +1290,115 @@ fn placed_records_per_node_latency() {
         assert!(
             series.len() as u64 <= max_samples,
             "node {j}: at most one sample per fanned layer-step"
+        );
+    }
+}
+
+/// Median of a latency series (0 if empty) — the per-node twin of the netem sim's
+/// `median_p99`, kept local to the order-independence lock.
+fn median_of(samples: &[Duration]) -> Duration {
+    if samples.is_empty() {
+        return Duration::ZERO;
+    }
+    let mut v = samples.to_vec();
+    v.sort_unstable();
+    v[v.len() / 2]
+}
+
+/// CI ORDER-INDEPENDENCE LOCK (#28): the per-node latency series is attributed to
+/// the node that OWNS each answer, independent of the connect (node-index) order —
+/// a fast node co-fanned with a slower one no longer inherits its head-of-line
+/// wait. Two disjoint nodes are both fanned every layer-step (top_k routes every
+/// expert, and each node holds ≥1 expert per layer); one responds fast (0 ms), one
+/// slow (`DELAY`). We run BOTH delay-to-index assignments — [fast, slow] and
+/// [slow, fast] — and in each assert (a) the slow responder's median exceeds the
+/// fast responder's by ≥ `DELAY/2` AND (b) the fast responder's own median stays
+/// BELOW `DELAY/2`. Assertion (b) for the [slow, fast] order is the pre-fix
+/// failure: the fast index-1 node, read only AFTER the slow index-0 node drained,
+/// inherited its ~`DELAY` head-of-line wait and reported ~`DELAY` instead of ~0.
+#[test]
+fn placed_per_node_latency_order_independent() {
+    const DELAY: Duration = Duration::from_millis(40);
+    let root = tmp("placed-order-indep");
+    // A few experts per layer so build_placement splits each layer across BOTH
+    // disjoint nodes; top_k = experts routes every one, so both nodes are fanned
+    // on every layer-step (the co-fanning the HOL artifact needs).
+    let experts = 6u16;
+    let params = Params {
+        experts,
+        ..Params::default()
+    };
+    let model = root.join("model");
+    fixture::generate(&params, &model).unwrap();
+    let carved = root.join("carved");
+    carve::run(
+        &model,
+        &Options {
+            out: carved.clone(),
+            model_name: "order-indep".into(),
+            model_rev: String::new(),
+            dtype: Dtype::Fp8,
+        },
+    )
+    .unwrap();
+
+    let manifest = Manifest::load(&carved.join(manifest::FILE_NAME)).unwrap();
+    let hidden = manifest.model.hidden as usize;
+    let moe_layers = manifest.model.moe_layers as u16;
+    let spine = Spine::load(&model, &manifest, config(hidden, experts as usize)).unwrap();
+    let all = all_expert_keys(&manifest);
+    let heat = bootstrap_heat(&all, &[]);
+    let map = build_placement(&uniform_nodes(2), &heat, 1).unwrap();
+
+    // Precondition: r=1 disjoint, both nodes non-empty, and co-fanned on EVERY MoE
+    // layer (each holds ≥1 expert per layer) — else the HOL artifact never arises
+    // and the lock would not pin the fix.
+    for j in 0..2 {
+        assert!(!map.subset_for(j).is_empty(), "node {j} must hold a shard");
+    }
+    for l in 0..moe_layers {
+        for j in 0..2 {
+            assert!(
+                map.subset_for(j).iter().any(|&(layer, _)| layer == l),
+                "node {j} must hold an expert on layer {l} (co-fanning precondition)"
+            );
+        }
+    }
+
+    let prompts: Vec<&[u32]> = vec![&[1, 2, 3]];
+    let tokens = 6usize;
+
+    // Two connect orders, differing ONLY in which node index carries the slow
+    // responder. `[fast, slow]` already worked pre-fix (ascending read order
+    // matches delay order); `[slow, fast]` is the pre-fix failure.
+    for (slow_idx, delays) in [
+        (1usize, [Duration::ZERO, DELAY]),
+        (0usize, [DELAY, Duration::ZERO]),
+    ] {
+        let fast_idx = 1 - slow_idx;
+        let per_node =
+            run_placed_delayed(&spine, &carved, &prompts, tokens, map.clone(), &all, delays);
+        assert_eq!(per_node.len(), 2, "one latency series per node");
+        let slow_median = median_of(&per_node[slow_idx]);
+        let fast_median = median_of(&per_node[fast_idx]);
+        assert!(
+            !per_node[slow_idx].is_empty() && !per_node[fast_idx].is_empty(),
+            "both nodes must accrue samples (slow_idx={slow_idx})"
+        );
+        // (a) the slow responder is measurably slower — attribution tracks delay.
+        assert!(
+            slow_median >= fast_median + DELAY / 2,
+            "slow_idx={slow_idx}: slow median {slow_median:.1?} must exceed fast median \
+             {fast_median:.1?} by >= {:.1?}",
+            DELAY / 2
+        );
+        // (b) the fast responder is NOT inflated by the slow node's HOL wait — the
+        // property #28 was about (fails pre-fix for slow_idx=0).
+        assert!(
+            fast_median < DELAY / 2,
+            "slow_idx={slow_idx}: fast node (index {fast_idx}) median {fast_median:.1?} must \
+             stay below {:.1?} — a larger value is the #28 head-of-line inflation",
+            DELAY / 2
         );
     }
 }
@@ -2433,7 +2700,9 @@ fn netem_placement_fixture(node_descs: &[NodeDesc], shaped: &[ShapedNode], steps
     let spine = Spine::load(&model, &manifest, config(hidden, 2)).unwrap();
     let all = all_expert_keys(&manifest);
     let map = placement_heat_map(node_descs, &all);
-    report_placement(&spine, &carved, shaped, &map, &all, steps, moe_layers);
+    // compute≈0 fixture: the per-node time IS the shaped one-way delay, so assert
+    // each node's p99 tracks its delay (the #28 order-independence re-measurement).
+    report_placement(&spine, &carved, shaped, &map, &all, steps, moe_layers, true);
 }
 
 /// Real-model anchor (KENNY_MODEL_DIR): the actual Qwen3-30B-A3B placed across the
@@ -2458,7 +2727,9 @@ fn netem_placement_real(model_dir: &Path, node_descs: &[NodeDesc], shaped: &[Sha
     let all = all_expert_keys(&manifest);
     let map = placement_heat_map(node_descs, &all);
     // max_new 1 → prompt_len 2 priming forwards; the RTT floor dominates the anchor.
-    report_placement(&spine, &carved, shaped, &map, &all, 1, moe_layers);
+    // Real compute dominates the shaped delay here, so per-node p99 does NOT track
+    // delay — the delay-tracking assertion is a fixture-arm-only invariant.
+    report_placement(&spine, &carved, shaped, &map, &all, 1, moe_layers, false);
 }
 
 /// A mildly-skewed (Zipf-ish) placement heat so the fat uplinks actually win the
@@ -2486,10 +2757,19 @@ fn report_placement(
     all: &[(u16, u16)],
     steps: usize,
     moe_layers: u64,
+    assert_delay_tracking: bool,
 ) {
     let binds: Vec<String> = shaped.iter().map(|n| format!("{}:0", n.ip)).collect();
     let vocab = spine.vocab();
     let prompt_len = 2usize;
+    // The delay-tracking assertion is only meaningful when the nodes are shaped to
+    // DISTINCT delays (else there is no order to be independent of).
+    let distinct_delays = {
+        let mut ds: Vec<u64> = shaped.iter().map(|n| n.delay_ms).collect();
+        ds.sort_unstable();
+        ds.dedup();
+        ds.len()
+    };
 
     eprintln!(
         "M4 placement sim: {moe_layers} MoE layers, {} shaped nodes, {steps} gen steps, fp8 wire",
@@ -2529,5 +2809,31 @@ fn report_placement(
             stats.wire_down,
             per_node_str.join(" ")
         );
+        // Order-independence re-measurement (#28): on the compute≈0 fixture each
+        // node's per-node p99 IS its shaped one-way delay, so it must track that
+        // delay regardless of connect order. Pre-fix, running `netem-bench.sh
+        // --reverse` (connect order opposite to delay order) inflated the faster
+        // nodes to the slowest node's value; this now holds either way. Allow a
+        // generous per-node slack (max(15 ms, delay/2)) for netem quantization and
+        // the sparse-node worst-of-n tail. Skipped for the real arm (compute
+        // dominates) and for a uniform-delay fallback (nothing to be independent of).
+        if assert_delay_tracking && distinct_delays >= 2 {
+            for (n, series) in shaped.iter().zip(&per_node) {
+                if series.is_empty() {
+                    continue;
+                }
+                let (_m, p) = median_p99(series);
+                let slack_ms = std::cmp::max(15, n.delay_ms / 2);
+                let bound = Duration::from_millis(n.delay_ms + slack_ms);
+                assert!(
+                    p <= bound,
+                    "B={b} node {} (netem delay {} ms): per-node p99 {p:.1?} exceeds \
+                     {bound:.1?} — per-node latency is NOT tracking its shaped delay \
+                     (order-dependent attribution regressed, #28)",
+                    n.ip,
+                    n.delay_ms
+                );
+            }
+        }
     }
 }

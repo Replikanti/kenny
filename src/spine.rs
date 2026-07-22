@@ -620,9 +620,44 @@ impl NodeDispatch {
         &self.addr
     }
 
-    /// Arm this connection's receive deadline for the next gather(s).
-    fn set_read_deadline(&self, deadline: Duration) {
-        let _ = self.transport.get_ref().set_read_timeout(Some(deadline));
+    /// Arm (or clear) this connection's receive deadline for the next gather(s).
+    /// `None` clears it back to a blocking read (the unhedged posture); `Some(d)`
+    /// bounds each subsequent gather by `d`. Also used to reset the socket after a
+    /// `poll_readable` probe left its short readiness timeout on the stream.
+    fn set_read_deadline(&self, deadline: Option<Duration>) {
+        let _ = self.transport.get_ref().set_read_timeout(deadline);
+    }
+
+    /// Non-consuming readiness probe: arm a short receive timeout and PEEK a
+    /// single byte. `Ok(true)` when this node has data pending — or has hung up
+    /// (EOF, which the real gather read surfaces) — `Ok(false)` on the probe
+    /// timeout (`WouldBlock` / `TimedOut`), so the caller can sweep the next node.
+    /// The peek blocks in-kernel for `slice`, so a poll sweep is a bounded wait,
+    /// not a busy-spin. Peek never consumes, so the `down` byte accounting stays
+    /// exact — the subsequent `recv_gather` counts each byte once (the "count
+    /// bytes at the socket" rule holds; the wire goldens are untouched).
+    fn poll_readable(&self, slice: Duration) -> Result<bool> {
+        let stream = self.transport.get_ref();
+        // Best-effort like the other `set_read_timeout` hints: a failure on a
+        // live socket is not a real condition, and the peek below still reports.
+        let _ = stream.set_read_timeout(Some(slice));
+        let mut probe = [0u8; 1];
+        match stream.peek(&mut probe) {
+            // n > 0 ⇒ pending; n == 0 ⇒ EOF (let the real read surface it).
+            Ok(_) => Ok(true),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(e) => Err(Error::parse(format!(
+                "spine: readiness peek on node {} failed: {e}",
+                self.addr
+            ))),
+        }
     }
 
     /// Receive one gather under the currently-armed deadline, decoded against
@@ -803,6 +838,15 @@ impl Dispatcher for NodeDispatch {
 /// only a rare double packet loss trips it (see `HedgedDispatch::connect`).
 const HEDGE_BUDGET_MULT: u32 = 6;
 
+/// Readiness-poll slice for the `PlacedDispatch` phase-2 gather (`poll_readable`).
+/// 1 ms is the floor: `set_read_timeout(0)` means block-forever (the same clamp
+/// `connect()` applies to `hedge_delay`), so a shorter slice is impossible. A
+/// sweep of N still-unread nodes costs ≤ `N × POLL_SLICE` (≤ 3 ms at N = 3), two
+/// orders of magnitude below the netem fixture's ~40 ms inter-node RTT deltas, so
+/// the attribution skew it adds is negligible. The peek BLOCKS in-kernel for the
+/// slice, so the sweep is a bounded wait, NOT a busy-spin.
+const POLL_SLICE: Duration = Duration::from_millis(1);
+
 /// Tail-latency hedged dispatch (ADR-0010): TWO `NodeDispatch` connections to a
 /// pair of nodes that BOTH hold every requested expert. Each layer is dispatched
 /// on the primary first; if the primary does not answer within `hedge_delay`, the
@@ -886,7 +930,7 @@ impl Dispatcher for HedgedDispatch {
         for &(x, experts) in items {
             self.primary.send_one(layer, x, experts)?;
         }
-        self.primary.set_read_deadline(self.hedge_delay);
+        self.primary.set_read_deadline(Some(self.hedge_delay));
         let mut out: Vec<Vec<Option<Vec<f32>>>> = Vec::with_capacity(items.len());
         let mut stalled_at = None;
         for (i, &(_x, experts)) in items.iter().enumerate() {
@@ -910,7 +954,7 @@ impl Dispatcher for HedgedDispatch {
         for &(x, experts) in &items[start..] {
             self.secondary.send_one(layer, x, experts)?;
         }
-        self.secondary.set_read_deadline(self.hedge_budget);
+        self.secondary.set_read_deadline(Some(self.hedge_budget));
         let mut sec_stalled_at = None;
         for (j, &(_x, experts)) in items[start..].iter().enumerate() {
             match self.secondary.recv_gather_opt(experts)? {
@@ -998,6 +1042,15 @@ type NodeWork = Vec<(usize, SubList)>;
 /// is a fraction of the routed set, so send-all-then-read is deadlock-free — the
 /// same posture `HedgedDispatch` and the composed-wire batch take. Output is
 /// bit-identical to `LocalDispatch`: hoisting sends reorders no reassembly.
+///
+/// Phase 2 gathers each node when ITS OWN answer is first readable, NOT in fixed
+/// node-index order (#28): a non-consuming `peek` (`poll_readable`) detects which
+/// still-unread node has data pending, and only that node is then drained with a
+/// full gather read. So a node's recorded per-node latency is its OWN round-trip,
+/// never inflated by a slower co-fanned node's head-of-line wait — the per-node
+/// series is order-independent (the ADR-0009 "direct output" attribution the
+/// netem sim reports p99 over). The peek is non-consuming, so the `down` byte
+/// count is unchanged; the wire stays untouched (`WIRE_VERSION` 1, goldens frozen).
 pub struct PlacedDispatch {
     nodes: Vec<NodeDispatch>,
     map: PlacementMap,
@@ -1012,10 +1065,15 @@ pub struct PlacedDispatch {
     /// Layer-steps on which the hedge fired (a replica-set second-send ran) —
     /// read into `GenStats` at the end of a run, like `HedgedDispatch`.
     hedges_fired: u64,
-    /// Per-node measured round-trip of each fan (send-complete → gather-complete),
-    /// indexed by node. The per-node step-latency series ADR-0009 names as its
-    /// "direct output" — read by the netns/netem sim to report per-node p99 across
-    /// heterogeneous shaped uplinks. Spine-local, never on the wire.
+    /// Per-node measured round-trip of each fan, indexed by node: the interval
+    /// from node j's phase-1 send-complete (`sent_at[j]`) to the moment j's OWN
+    /// gather(s) for the round are fully received and decoded — attributed to j
+    /// independent of any co-fanned node (no head-of-line inheritance from a
+    /// slower node, #28). Residual skew is ≤ `POLL_SLICE` + j's own frame-drain,
+    /// never the slowest node's RTT. The per-node step-latency series ADR-0009
+    /// names as its "direct output" — read by the netns/netem sim to report
+    /// per-node p99 across heterogeneous shaped uplinks. Spine-local, never on the
+    /// wire.
     per_node_lat: Vec<Vec<Duration>>,
 }
 
@@ -1093,19 +1151,22 @@ impl PlacedDispatch {
         Ok(())
     }
 
-    /// Phase 2 of the concurrent fan: read this node's gathers back in send order,
+    /// Phase 2 of the concurrent fan, per READY node: `poll_readable` has already
+    /// confirmed this node's answer is pending, so drain its gathers in send order,
     /// filling answered `y`s into `out` at their routed positions, and record the
-    /// per-node round-trip (`sent` → now) into `per_node_lat`. A stalled read
+    /// per-node round-trip (`sent` → now) into `per_node_lat`. `read_timeout` is
+    /// the receive deadline to arm for the gather reads — `None` blocks (the
+    /// unhedged path never stalls), `Some(d)` bounds each read (the hedge budget);
+    /// it also resets the socket past the short probe timeout `poll_readable` left.
+    /// A stalled read (a later sub-list frame not arriving within the budget)
     /// head-of-line-blocks the rest on this one connection, so the tail is left
     /// unanswered (it spills to the next replica round, or renorms) and the
-    /// desynced connection is torn down + reconnected. With no `deadline` armed the
-    /// reads block (the unhedged path never stalls). The response was already in
-    /// flight from the phase-1 send, so this read overlaps the other nodes' reads.
-    fn read_from_node(
+    /// desynced connection is torn down + reconnected.
+    fn drain_node(
         &mut self,
         node_idx: usize,
         work: &NodeWork,
-        deadline: Option<Duration>,
+        read_timeout: Option<Duration>,
         sent: Instant,
         out: &mut [Vec<Option<Vec<f32>>>],
     ) -> Result<()> {
@@ -1113,9 +1174,7 @@ impl PlacedDispatch {
         let stalled;
         {
             let nd = &mut self.nodes[node_idx];
-            if let Some(d) = deadline {
-                nd.set_read_deadline(d);
-            }
+            nd.set_read_deadline(read_timeout);
             let mut s = false;
             for (i, sub) in work {
                 if s {
@@ -1137,6 +1196,18 @@ impl PlacedDispatch {
                 nd.reconnect()?;
             }
         }
+        self.per_node_lat[node_idx].push(elapsed);
+        Ok(())
+    }
+
+    /// The hedged-round budget-expiry path: the round's wall-clock budget elapsed
+    /// before this node produced any readable byte, so its WHOLE share is left
+    /// unanswered (it spills to the next replica round, or renorms) and the still-
+    /// in-flight connection is resynced. Record ≈budget-elapsed as its per-node
+    /// sample — the same outcome the old fixed-order read reached on a timeout.
+    fn stall_node(&mut self, node_idx: usize, sent: Instant) -> Result<()> {
+        let elapsed = sent.elapsed();
+        self.nodes[node_idx].reconnect()?;
         self.per_node_lat[node_idx].push(elapsed);
         Ok(())
     }
@@ -1205,16 +1276,52 @@ impl Dispatcher for PlacedDispatch {
                 }
             });
             let node_work: Vec<(usize, NodeWork)> = by_node.into_iter().collect();
+            let n = node_work.len();
             // Concurrent split-stream: send to every node first (phase 1), then
             // read every node back (phase 2), so the per-node round-trips overlap
             // and the round costs ≈ max over the nodes, not their sum.
-            let mut sent_at: Vec<Instant> = Vec::with_capacity(node_work.len());
+            let mut sent_at: Vec<Instant> = Vec::with_capacity(n);
             for (node_idx, work) in &node_work {
                 self.send_to_node(layer, *node_idx, work, items)?;
                 sent_at.push(Instant::now());
             }
-            for ((node_idx, work), sent) in node_work.iter().zip(sent_at) {
-                self.read_from_node(*node_idx, work, deadline, sent, &mut out)?;
+            // Phase 2, readiness-driven (#28): read each node when ITS OWN answer
+            // is first readable, NOT in fixed node-index order, so the recorded
+            // per-node latency is that node's true round-trip — never inflated by
+            // a slower co-fanned node's head-of-line wait. A hedged round carries a
+            // per-node wall-clock budget (`sent_at[k] + deadline`); when it elapses
+            // before node k answers, k is stalled (its share spills to the next
+            // replica). Unhedged: no budget, drain every node when it is ready.
+            let budget_at: Option<Vec<Instant>> =
+                deadline.map(|d| sent_at.iter().map(|&s| s + d).collect());
+            let mut done = vec![false; n];
+            let mut unread = n;
+            while unread > 0 {
+                for k in 0..n {
+                    if done[k] {
+                        continue;
+                    }
+                    let (node_idx, work) = &node_work[k];
+                    if let Some(budgets) = &budget_at
+                        && Instant::now() >= budgets[k]
+                    {
+                        self.stall_node(*node_idx, sent_at[k])?;
+                        done[k] = true;
+                        unread -= 1;
+                        continue;
+                    }
+                    if self.nodes[*node_idx].poll_readable(POLL_SLICE)? {
+                        // Ready: drain under the remaining round budget (hedged) or
+                        // a blocking read (unhedged), resetting the probe timeout.
+                        let read_timeout = budget_at.as_ref().map(|b| {
+                            b[k].saturating_duration_since(Instant::now())
+                                .max(POLL_SLICE)
+                        });
+                        self.drain_node(*node_idx, work, read_timeout, sent_at[k], &mut out)?;
+                        done[k] = true;
+                        unread -= 1;
+                    }
+                }
             }
             if self.hedge_delay.is_none() {
                 break; // no hedge: one primary round, a straggler renorms
