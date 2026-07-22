@@ -10,7 +10,7 @@ use crate::diff;
 use crate::error::{Error, Result};
 use crate::fixture;
 use crate::manifest::{self, Manifest};
-use crate::node;
+use crate::node::{self, Hold};
 use crate::placement::{HeatMap, NodeDesc, build_placement};
 use crate::rng::SplitMix64;
 use crate::spine::{self, Config, LocalDispatch, NodeDispatch, PlacedDispatch, Spine};
@@ -43,11 +43,19 @@ USAGE:
         carves must match bit-for-bit; fp8/int8 report max-abs and cosine.
 
     kenny node --carved <dir> [--listen <addr>]
+               [--hold <l:e,l:e,...> | --shard <i/n>]
         Serve the carve's experts (ADR-0013): load the manifest, then answer
         dispatch/gather over sync TCP (ADR-0016). Prints `listening <addr>` on
         stdout — the OS-assigned address, since --listen defaults to
         127.0.0.1:0 (a fixed port is flaky under concurrency). Experts the node
         does not hold answer not-held (feeds the spine's renorm, ADR-0008).
+        --hold restricts the node to a SUBSET of the carve (the ADR-0009 held
+        subset a placement map assigns): --hold 0:1,1:3 holds exactly those two
+        experts, everything else answers not-held. --shard i/n instead holds
+        shard i of n by a stable hash of (layer,expert), so n nodes launched with
+        --shard 0/n .. (n-1)/n partition the catalog into DISJOINT subsets with no
+        placement file — the sim's distinct-holding-nodes knob. The serve loop and
+        the wire are untouched (ADR-0024): a subset node just answers not-held more.
 
     kenny spine --carved <dir> --model <model_dir> (--node <addr>... | --local)
                 [--tokens N] [--prompt id,id,...] [--batch N] [--codec fp8|bf16]
@@ -314,11 +322,24 @@ fn run_node(args: &[String]) -> Result<()> {
     // A5: default to an OS-assigned port; a fixed port flakes under CI
     // concurrency. The bound address is printed on stdout for discovery.
     let mut listen = String::from("127.0.0.1:0");
+    let mut hold: Option<Hold> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--carved" => carved = Some(PathBuf::from(value(args, &mut i, "--carved")?)),
             "--listen" => listen = value(args, &mut i, "--listen")?.to_string(),
+            "--hold" => {
+                if hold.is_some() {
+                    return Err(Error::usage("node: pass at most one of --hold or --shard"));
+                }
+                hold = Some(Hold::Only(parse_hold(value(args, &mut i, "--hold")?)?));
+            }
+            "--shard" => {
+                if hold.is_some() {
+                    return Err(Error::usage("node: pass at most one of --hold or --shard"));
+                }
+                hold = Some(parse_shard(value(args, &mut i, "--shard")?)?);
+            }
             other => {
                 return Err(Error::usage(format!("node: unexpected argument {other:?}")));
             }
@@ -326,7 +347,51 @@ fn run_node(args: &[String]) -> Result<()> {
         i += 1;
     }
     let carved = carved.ok_or_else(|| Error::usage("node: --carved is required"))?;
-    node::serve(&carved, &listen)
+    node::serve(&carved, &listen, hold.as_ref())
+}
+
+/// Parse a `--hold` keep-list, e.g. `0:1,1:3` -> `[(0,1),(1,3)]`.
+fn parse_hold(s: &str) -> Result<Vec<(u16, u16)>> {
+    s.split(',')
+        .map(|pair| {
+            let (l, e) = pair.trim().split_once(':').ok_or_else(|| {
+                Error::usage(format!("--hold: {pair:?} is not a layer:expert pair"))
+            })?;
+            let layer = l
+                .trim()
+                .parse::<u16>()
+                .map_err(|_| Error::usage(format!("--hold: {l:?} is not a layer id")))?;
+            let expert = e
+                .trim()
+                .parse::<u16>()
+                .map_err(|_| Error::usage(format!("--hold: {e:?} is not an expert id")))?;
+            Ok((layer, expert))
+        })
+        .collect()
+}
+
+/// Parse a `--shard i/n` spec, requiring `0 <= i < n` and `n >= 1`.
+fn parse_shard(s: &str) -> Result<Hold> {
+    let (i, n) = s
+        .split_once('/')
+        .ok_or_else(|| Error::usage(format!("--shard: {s:?} is not i/n")))?;
+    let i = i
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| Error::usage(format!("--shard: {i:?} is not a shard index")))?;
+    let n = n
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| Error::usage(format!("--shard: {n:?} is not a shard count")))?;
+    if n == 0 {
+        return Err(Error::usage("--shard: n must be >= 1"));
+    }
+    if i >= n {
+        return Err(Error::usage(format!(
+            "--shard: shard index {i} out of range for n={n}"
+        )));
+    }
+    Ok(Hold::Shard { i, n })
 }
 
 /// Parse a comma-separated token-id list, e.g. `--prompt 1,2,3`.

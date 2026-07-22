@@ -918,7 +918,20 @@ fn spawn_subset_node(
     keep: HashSet<(u16, u16)>,
     done: Arc<AtomicBool>,
 ) -> (SocketAddr, thread::JoinHandle<()>) {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    spawn_subset_node_at(carved, all_experts, keep, done, "127.0.0.1:0")
+}
+
+/// `spawn_subset_node` bound to a specific address — the netem sim binds each
+/// node to a DISTINCT loopback IP (127.0.0.2, 127.0.0.3, …) so a per-destination
+/// `tc netem` band can shape each node's uplink differently on one host.
+fn spawn_subset_node_at(
+    carved: &Path,
+    all_experts: &[(u16, u16)],
+    keep: HashSet<(u16, u16)>,
+    done: Arc<AtomicBool>,
+    bind: &str,
+) -> (SocketAddr, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind(bind).unwrap();
     let addr = listener.local_addr().unwrap();
     let carved_p = carved.to_path_buf();
     let drops: Vec<(u16, u16)> = all_experts
@@ -1006,6 +1019,121 @@ fn via_placed_batch(
         handle.join().unwrap();
     }
     out
+}
+
+/// The sim's measurement harness: like `via_placed_batch` but binds each node to
+/// a caller-chosen loopback address (so a per-dst `tc netem` band can shape it)
+/// and returns the per-node latency series + node labels captured BEFORE the
+/// dispatcher is dropped — the ADR-0009 per-node step-latency samples. `r = 1`
+/// disjoint placement keeps each node's timing isolated.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+fn run_placed_shaped(
+    spine: &Spine,
+    carved: &Path,
+    which: &str,
+    prompts: &[&[u32]],
+    tokens: usize,
+    map: PlacementMap,
+    bind_addrs: &[String],
+    all_experts: &[(u16, u16)],
+) -> (
+    Vec<Vec<u32>>,
+    spine::GenStats,
+    Vec<Vec<Duration>>,
+    Vec<String>,
+) {
+    let manifest = Manifest::load(&carved.join(manifest::FILE_NAME)).unwrap();
+    let identity = *blake3::hash(&manifest.canonical_bytes()).as_bytes();
+    let hidden = manifest.model.hidden as usize;
+
+    let mut addrs = Vec::with_capacity(bind_addrs.len());
+    let mut dones = Vec::with_capacity(bind_addrs.len());
+    let mut handles = Vec::with_capacity(bind_addrs.len());
+    for (j, bind) in bind_addrs.iter().enumerate() {
+        let done = Arc::new(AtomicBool::new(false));
+        let keep: HashSet<(u16, u16)> = map.subset_for(j).into_iter().collect();
+        let (addr, handle) = spawn_subset_node_at(carved, all_experts, keep, done.clone(), bind);
+        addrs.push(addr);
+        dones.push(done);
+        handles.push(handle);
+    }
+    let addr_strs: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
+
+    let mut disp = PlacedDispatch::connect(
+        &addr_strs,
+        || make_codec(which),
+        identity,
+        hidden,
+        map,
+        None,
+    )
+    .unwrap();
+    let (outs, stats) = spine.generate_batch(&mut disp, prompts, tokens).unwrap();
+    let per_node: Vec<Vec<Duration>> = disp.per_node_latencies().to_vec();
+    let labels = disp.node_addrs();
+    drop(disp);
+
+    for done in &dones {
+        done.store(true, Ordering::SeqCst);
+    }
+    for addr in &addrs {
+        let _ = TcpStream::connect(addr);
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    (outs, stats, per_node, labels)
+}
+
+/// CI lock (localhost, no netns): the per-node latency accounting records one
+/// sample per node per fanned layer-step and labels them by dial address. This
+/// is the ADR-0009 per-node step-latency series the netem sim reports p99 over;
+/// here it only proves the plumbing (every fanned node accrues samples, the
+/// count equals the fanned layer-steps), since localhost RTT≈0 carries no signal.
+#[test]
+fn placed_records_per_node_latency() {
+    let root = tmp("placed-per-node-lat");
+    let (model, carved) = fixture_and_carve(&root);
+    let manifest = Manifest::load(&carved.join(manifest::FILE_NAME)).unwrap();
+    let hidden = manifest.model.hidden as usize;
+    let moe_layers = manifest.model.moe_layers as u64;
+    let spine = Spine::load(&model, &manifest, config(hidden, 2)).unwrap();
+    let all = all_expert_keys(&manifest);
+    let nodes = uniform_nodes(3);
+
+    let tokens = 4usize;
+    let prompts: Vec<&[u32]> = vec![&[1, 2, 3]];
+    let forwards = (prompts[0].len() + tokens - 1) as u64;
+
+    let heat = bootstrap_heat(&all, &[]);
+    let map = build_placement(&nodes, &heat, 1).unwrap();
+    // Every one of the 3 uniform nodes must actually hold a non-empty shard so the
+    // fan reaches all three (else there is no per-node series to speak of).
+    for j in 0..3 {
+        assert!(!map.subset_for(j).is_empty(), "node {j} must hold a shard");
+    }
+    let bind: Vec<String> = vec!["127.0.0.1:0".into(); 3];
+    let (local, _) = via_local_batch(&spine, &carved, "fp8", &prompts, tokens, &[]);
+    let (placed, _stats, per_node, labels) =
+        run_placed_shaped(&spine, &carved, "fp8", &prompts, tokens, map, &bind, &all);
+
+    assert_eq!(
+        local, placed,
+        "the shaped-harness run is still bit-for-bit local"
+    );
+    assert_eq!(per_node.len(), 3, "one latency series per node");
+    assert_eq!(labels.len(), 3, "one dial-address label per node");
+    // Each node is the primary of at least one routed expert on SOME step, so over
+    // a whole run every node accrues samples; the busiest accrues one per fanned
+    // layer-step (forwards × MoE layers).
+    let max_samples = forwards * moe_layers;
+    for (j, series) in per_node.iter().enumerate() {
+        assert!(!series.is_empty(), "node {j} must record latency samples");
+        assert!(
+            series.len() as u64 <= max_samples,
+            "node {j}: at most one sample per fanned layer-step"
+        );
+    }
 }
 
 /// THE M4 GATE: a placed fan-out over DISTINCT nodes reproduces `LocalDispatch`
@@ -2106,4 +2234,227 @@ fn netem_hedge() {
         "on\t{on_med:.2?}\t{on_p99:.2?}\t{}\t{rate:.4}\t{}",
         on.hedges_fired, on.renorm_steps
     );
+}
+
+// -------------------------------------------------------------------------
+// M4 — simulated multi-node WAN placement (ADR-0009 / ADR-0024). The FIRST time
+// distinct experts sit on distinct, HETEROGENEOUSLY-SHAPED nodes: three `kenny`
+// nodes bound to distinct loopback IPs, each holding its `build_placement`
+// subset, fanned by a `PlacedDispatch` whose sends are hoisted so the per-node
+// round-trips overlap. `tools/netem-bench.sh --nodes 3 --placement` installs a
+// `tc prio` qdisc with a per-destination-IP `netem delay+rate` band per node
+// (the plan's 60 ms / 100 Mbit class etc.), exports the node table as
+// KENNY_NETEM_NODES, and runs this. Reports the ADR-0009 DIRECT OUTPUT — per-node
+// step p99 across the shaped uplinks — plus aggregate tok/s and wire bytes. Gated
+// on KENNY_NETEM_NODES, so a plain `cargo test` never touches netem; heterogeneous
+// per-dst shaping needs the netns (uniform-`lo` fallback => uniform per-node p99).
+// -------------------------------------------------------------------------
+
+/// One shaped node from KENNY_NETEM_NODES: `ip:delay_ms:rate_mbit`. `delay`/`rate`
+/// are the LABELS of the `tc` band the shell installed for this node's IP; the
+/// test binds the node to `ip` so its packets hit that band.
+struct ShapedNode {
+    ip: String,
+    delay_ms: u64,
+    rate_mbit: u32,
+}
+
+fn parse_shaped_nodes(spec: &str) -> Vec<ShapedNode> {
+    spec.split(',')
+        .map(|f| {
+            let parts: Vec<&str> = f.trim().split(':').collect();
+            assert_eq!(
+                parts.len(),
+                3,
+                "KENNY_NETEM_NODES entry {f:?} must be ip:delay_ms:rate_mbit"
+            );
+            ShapedNode {
+                ip: parts[0].to_string(),
+                delay_ms: parts[1].parse().expect("delay_ms integer"),
+                rate_mbit: parts[2].parse().expect("rate_mbit integer"),
+            }
+        })
+        .collect()
+}
+
+/// `(median, p99)` of a latency series (nearest-rank p99), or zeros if empty —
+/// the per-node twin of `GenStats::latency_median_p99`.
+fn median_p99(samples: &[Duration]) -> (Duration, Duration) {
+    if samples.is_empty() {
+        return (Duration::ZERO, Duration::ZERO);
+    }
+    let mut v = samples.to_vec();
+    v.sort_unstable();
+    let median = v[v.len() / 2];
+    let rank = (((v.len() as f64) * 0.99).ceil() as usize).clamp(1, v.len()) - 1;
+    (median, v[rank])
+}
+
+#[test]
+fn netem_placement() {
+    let Some(spec) = std::env::var_os("KENNY_NETEM_NODES") else {
+        eprintln!(
+            "KENNY_NETEM_NODES unset — skipping M4 netem placement sim \
+             (run via tools/netem-bench.sh --nodes 3 --placement)"
+        );
+        return;
+    };
+    let nodes = parse_shaped_nodes(&spec.to_string_lossy());
+    assert!(
+        nodes.len() >= 2,
+        "the placement sim needs >= 2 shaped nodes"
+    );
+    // ADR-0009 node descriptors: distinct failure domains (each its own IP), and
+    // uplink_class ∝ the shaped rate so hot experts flow to the fat uplinks and
+    // step time equalizes in TIME (the thing a single shared `lo` cannot show).
+    let node_descs: Vec<NodeDesc> = nodes
+        .iter()
+        .map(|n| NodeDesc {
+            id: n.ip.clone(),
+            failure_domain: n.ip.clone(),
+            uplink_class: n.rate_mbit.max(1),
+            ram_class: 1,
+        })
+        .collect();
+    let steps: usize = std::env::var("KENNY_NETEM_STEPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
+
+    match std::env::var_os("KENNY_MODEL_DIR") {
+        Some(dir) => netem_placement_real(&PathBuf::from(dir), &node_descs, &nodes),
+        None => netem_placement_fixture(&node_descs, &nodes, steps),
+    }
+}
+
+/// Fixture arm (model-free): a 48-MoE-barrier compute≈0 model (≡ Qwen3-30B-A3B
+/// layer count) so the per-node RTT is the whole per-fan signal and the p99 tail
+/// populates cheaply. r=1 disjoint placement isolates each node's timing.
+fn netem_placement_fixture(node_descs: &[NodeDesc], shaped: &[ShapedNode], steps: usize) {
+    let root = tmp("netem-placement");
+    let params = Params {
+        layers: 48,
+        experts: 8,
+        hidden: 8,
+        inter: 4,
+        vocab: 32,
+        seed: 42,
+    };
+    let model = root.join("model");
+    fixture::generate(&params, &model).unwrap();
+    let carved = root.join("carved");
+    carve::run(
+        &model,
+        &Options {
+            out: carved.clone(),
+            model_name: "netem-placement".into(),
+            model_rev: String::new(),
+            dtype: Dtype::Fp8,
+        },
+    )
+    .unwrap();
+
+    let manifest = Manifest::load(&carved.join(manifest::FILE_NAME)).unwrap();
+    let hidden = manifest.model.hidden as usize;
+    let moe_layers = manifest.model.moe_layers as u64;
+    let spine = Spine::load(&model, &manifest, config(hidden, 2)).unwrap();
+    let all = all_expert_keys(&manifest);
+    let map = placement_heat_map(node_descs, &all);
+    report_placement(&spine, &carved, shaped, &map, &all, steps, moe_layers);
+}
+
+/// Real-model anchor (KENNY_MODEL_DIR): the actual Qwen3-30B-A3B placed across the
+/// shaped nodes at B∈{1,8}, prompt_len 2, a couple of priming forwards — the
+/// per-node step p99 at real payload/compute scale. Budget-capped per the plan.
+fn netem_placement_real(model_dir: &Path, node_descs: &[NodeDesc], shaped: &[ShapedNode]) {
+    let carved = Path::new(env!("CARGO_TARGET_TMPDIR")).join("real-carve-fp8");
+    std::fs::create_dir_all(&carved).unwrap();
+    carve::run(
+        model_dir,
+        &Options {
+            out: carved.clone(),
+            model_name: "qwen3-30b-a3b".into(),
+            model_rev: String::new(),
+            dtype: Dtype::Fp8,
+        },
+    )
+    .unwrap();
+    let manifest = Manifest::load(&carved.join(manifest::FILE_NAME)).unwrap();
+    let moe_layers = manifest.model.moe_layers as u64;
+    let spine = Spine::load(model_dir, &manifest, Config::default()).unwrap();
+    let all = all_expert_keys(&manifest);
+    let map = placement_heat_map(node_descs, &all);
+    // max_new 1 → prompt_len 2 priming forwards; the RTT floor dominates the anchor.
+    report_placement(&spine, &carved, shaped, &map, &all, 1, moe_layers);
+}
+
+/// A mildly-skewed (Zipf-ish) placement heat so the fat uplinks actually win the
+/// hot experts (exercising the ADR-0009 objective), while the cold tail spreads
+/// by the rendezvous tie-break. r=1 keeps the subsets disjoint for isolated
+/// per-node timing.
+fn placement_heat_map(node_descs: &[NodeDesc], all: &[(u16, u16)]) -> PlacementMap {
+    let mut heat = HeatMap::new();
+    for &(l, e) in all {
+        // Expert index 0 of each layer is the hot head; the rest are the cold tail.
+        let weight = if e == 0 { 32 } else { 1 };
+        for _ in 0..weight {
+            heat.record_dispatch(l, e);
+        }
+    }
+    build_placement(node_descs, &heat, 1).unwrap()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn report_placement(
+    spine: &Spine,
+    carved: &Path,
+    shaped: &[ShapedNode],
+    map: &PlacementMap,
+    all: &[(u16, u16)],
+    steps: usize,
+    moe_layers: u64,
+) {
+    let binds: Vec<String> = shaped.iter().map(|n| format!("{}:0", n.ip)).collect();
+    let vocab = spine.vocab();
+    let prompt_len = 2usize;
+
+    eprintln!(
+        "M4 placement sim: {moe_layers} MoE layers, {} shaped nodes, {steps} gen steps, fp8 wire",
+        shaped.len()
+    );
+    for (j, n) in shaped.iter().enumerate() {
+        eprintln!(
+            "  node {j}: {} — netem delay {} ms, rate {} Mbit, holds {} experts",
+            n.ip,
+            n.delay_ms,
+            n.rate_mbit,
+            map.subset_for(j).len()
+        );
+    }
+    eprintln!(
+        "B\tagg_tok/s\tstep_median\tstep_p99\tup_B\tdown_B\tper_node_p99(ms: node=median/p99)"
+    );
+    for b in [1usize, 8] {
+        let prompts = bench_prompts(b, prompt_len, vocab, 42);
+        let refs: Vec<&[u32]> = prompts.iter().map(Vec::as_slice).collect();
+        let (_outs, stats, per_node, labels) =
+            run_placed_shaped(spine, carved, "fp8", &refs, steps, map.clone(), &binds, all);
+        let secs = stats.elapsed.as_secs_f64();
+        let tok_s = stats.generated_tokens as f64 / secs;
+        let (median, p99) = stats.latency_median_p99();
+        let per_node_str: Vec<String> = per_node
+            .iter()
+            .zip(&labels)
+            .map(|(series, label)| {
+                let (m, p) = median_p99(series);
+                format!("{label}={:.1?}/{:.1?}", m, p)
+            })
+            .collect();
+        eprintln!(
+            "{b}\t{tok_s:.3}\t{median:.2?}\t{p99:.2?}\t{}\t{}\t{}",
+            stats.wire_up,
+            stats.wire_down,
+            per_node_str.join(" ")
+        );
+    }
 }

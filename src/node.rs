@@ -50,6 +50,45 @@ pub struct ServeStats {
     pub bytes_out: u64,
 }
 
+/// Which experts a node holds when a subset is requested (the sim's `--hold` /
+/// `--shard` knob, ADR-0009). Applied by dropping the complement from the index
+/// (`Node::apply_hold`); the serve loop and the wire stay untouched (ADR-0024).
+#[derive(Debug, Clone)]
+pub enum Hold {
+    /// Hold ONLY these `(layer, expert)` keys — the real-party `--hold <subset>`
+    /// path, fed the subset a placement map assigned this node
+    /// (`PlacementMap::subset_for`).
+    Only(Vec<(u16, u16)>),
+    /// Hold shard `i` of `n` by a stable hash of `(layer, expert)` — the sim's
+    /// `--shard i/n`, which deterministically partitions the catalog into `n`
+    /// DISJOINT subsets with no placement file, so a launcher can stand up `n`
+    /// distinct-holding nodes on one host.
+    Shard { i: u16, n: u16 },
+}
+
+impl Hold {
+    /// Whether a node under this hold keeps `(layer, expert)`.
+    fn holds(&self, layer: u16, expert: u16) -> bool {
+        match self {
+            Hold::Only(keep) => keep.contains(&(layer, expert)),
+            Hold::Shard { i, n } => shard_of(layer, expert, *n) == *i,
+        }
+    }
+}
+
+/// Stable shard index of `(layer, expert)` in `[0, n)` — a blake3 hash mod `n`,
+/// so the partition is deterministic and independent of expert ordering (the
+/// same discipline `src/placement.rs`'s rendezvous tie-break uses). `n == 0` is
+/// rejected by the CLI, so it never reaches here.
+fn shard_of(layer: u16, expert: u16, n: u16) -> u16 {
+    let mut h = blake3::Hasher::new();
+    h.update(&layer.to_le_bytes());
+    h.update(&expert.to_le_bytes());
+    let mut b = [0u8; 8];
+    b.copy_from_slice(&h.finalize().as_bytes()[..8]);
+    (u64::from_le_bytes(b) % n as u64) as u16
+}
+
 /// An expert-holding node backed by one carve directory.
 pub struct Node {
     manifest: Manifest,
@@ -173,6 +212,23 @@ impl Node {
         self.index.remove(&(layer, expert)).is_some()
     }
 
+    /// Restrict this node to a SUBSET of the carve's experts (the `--hold` /
+    /// `--shard` knob, ADR-0009 / ADR-0024): every expert the subset excludes is
+    /// dropped from the index via `drop_expert`, so the node simply answers
+    /// `not-held` for it. The serve loop and the wire are untouched — a subset
+    /// node is just a node that answers `not-held` more often (ADR-0024). This is
+    /// what lets N nodes hold DISTINCT expert sets on one host so the netns/netem
+    /// sim can measure per-node step p99 across heterogeneous uplinks. Returns the
+    /// number of experts retained.
+    pub fn apply_hold(&mut self, hold: &Hold) {
+        let all: Vec<(u16, u16)> = self.index.keys().copied().collect();
+        for (layer, expert) in all {
+            if !hold.holds(layer, expert) {
+                self.drop_expert(layer, expert);
+            }
+        }
+    }
+
     /// Serve one connection: verify the handshake, then answer dispatches until
     /// the peer hangs up. Returns the session stats.
     pub fn serve_connection<S: Read + Write>(&mut self, stream: S) -> Result<ServeStats> {
@@ -237,8 +293,11 @@ impl Node {
 /// OS-assigned free port) and prints `listening <addr>` to stdout, flushed, so a
 /// launcher can discover the port before the spine connects. A fixed port is
 /// flaky under CI concurrency, hence the ephemeral default.
-pub fn serve(carved_dir: &Path, listen: &str) -> Result<()> {
+pub fn serve(carved_dir: &Path, listen: &str, hold: Option<&Hold>) -> Result<()> {
     let mut node = Node::load(carved_dir)?;
+    if let Some(h) = hold {
+        node.apply_hold(h);
+    }
     let listener = TcpListener::bind(listen)
         .map_err(|e| Error::parse(format!("node: cannot bind {listen}: {e}")))?;
     let addr = listener
@@ -407,6 +466,44 @@ mod tests {
             assert_eq!(stats.experts_ok, 1);
             assert_eq!(stats.experts_not_held, 1);
         }
+    }
+
+    #[test]
+    fn apply_hold_only_keeps_the_named_subset() {
+        let out = carved(&tmp("hold-only"));
+        let mut node = Node::load(&out).unwrap();
+        assert_eq!(node.held(), 8);
+        node.apply_hold(&Hold::Only(vec![(0, 1), (1, 3)]));
+        assert_eq!(node.held(), 2, "only the two named experts survive");
+        assert!(node.index.contains_key(&(0, 1)));
+        assert!(node.index.contains_key(&(1, 3)));
+        assert!(!node.index.contains_key(&(0, 0)), "everything else dropped");
+    }
+
+    #[test]
+    fn apply_hold_shard_partitions_disjointly() {
+        // The 3 shards of the fixture's 8 experts must be disjoint and cover the
+        // whole catalog — the sim's distinct-holding-nodes invariant.
+        let out = carved(&tmp("hold-shard"));
+        let full = Node::load(&out).unwrap();
+        let all: Vec<(u16, u16)> = full.index.keys().copied().collect();
+        let n = 3u16;
+        let mut union: Vec<(u16, u16)> = Vec::new();
+        for i in 0..n {
+            let mut node = Node::load(&out).unwrap();
+            node.apply_hold(&Hold::Shard { i, n });
+            for &k in node.index.keys() {
+                assert!(!union.contains(&k), "shards must be disjoint");
+                union.push(k);
+            }
+        }
+        union.sort_unstable();
+        let mut want = all.clone();
+        want.sort_unstable();
+        assert_eq!(
+            union, want,
+            "the shards must cover every expert exactly once"
+        );
     }
 
     #[test]

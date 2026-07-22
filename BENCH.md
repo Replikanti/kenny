@@ -420,3 +420,138 @@ KENNY_MODEL_DIR=<model_dir> bash tools/netem-bench.sh --rtt 30
 # prints "netns unavailable — skipping M3 netem harness" and exits 0. A plain
 # `cargo test` never touches netem (the netem tests gate on KENNY_NETEM_RTT_MS).
 ```
+
+## M4 — simulated multi-node WAN, placement (2026-07-22)
+
+The first time DISTINCT experts sit on DISTINCT, HETEROGENEOUSLY-SHAPED nodes —
+ADR-0009 replication + heat-driven placement measured *in anger* (M1–M3 were a
+single node, or a fixture mirror pair where both nodes held every expert). **This
+is a SIMULATED WAN**: three `kenny` nodes bound to distinct loopback IPs
+(127.0.0.2/3/4) inside one unprivileged network namespace (`unshare -rn`), each
+behind its OWN `tc netem delay+rate` band selected by a per-destination `prio`
+u32 filter — **no second physical box, no real geography, no correlated churn**.
+The real multi-node party stays issue #6. A `PlacedDispatch` fans each MoE layer's
+routed experts to their holders on the existing wire (ADR-0024 — no frame change,
+`WIRE_VERSION` 1, the five wire goldens byte-identical, `src/node.rs` serve loop
+untouched) and reassembles into routed order, so a placed step is bit-for-bit a
+`LocalDispatch` step. Sends are hoisted ahead of the reads (a thread-free
+concurrent split-stream), so the per-node round-trips OVERLAP and a step costs ≈
+`max` over the contacted nodes' RTTs, not their sum.
+
+Same machine as M0–M3: 13th Gen Intel Core i7-1355U (12 threads), 30 GiB RAM,
+KIOXIA KXG8AZNV1T02 NVMe, Fedora Linux 7.1.3, rustc 1.95.0, kenny `--release`.
+Shaping classes (spine→node egress; the node→spine return is unshaped, so a node's
+measured RTT ≈ its one-way delay): node 0 `20 ms / 1000 Mbit` (fat-and-near),
+node 1 `60 ms / 100 Mbit`, node 2 `100 ms / 50 Mbit`. Placement is the ADR-0009
+bootstrap with a mildly-skewed heat (expert 0 of each layer hot) and `r = 1` so
+each node holds a DISJOINT subset and its timing is isolated. `uplink_class ∝` the
+shaped rate, so hot experts should flow to the fat uplinks.
+
+### Placement decision — hot experts land on the fat uplink (ADR-0009 objective)
+
+The engine placed the catalog by the `better` step-time order. Held counts
+(disjoint, summing to the full catalog):
+
+| node | shaping | fixture (384 experts) | real Qwen3-30B-A3B (6,144 experts) |
+|---|---|---|---|
+| 0 (127.0.0.2) | 20 ms / 1000 Mbit | **327** | **5,336** |
+| 1 (127.0.0.3) | 60 ms / 100 Mbit | 38 | 539 |
+| 2 (127.0.0.4) | 100 ms / 50 Mbit | 19 | 269 |
+
+The fat-and-near node draws ~85 % of the catalog (the hot head + its uplink
+share), the thin-and-far nodes take the cold tail — placement equalizing load in
+*time*, not expert count. This is the ADR-0009 claim a single shared `lo` qdisc
+(M3) could not exhibit.
+
+### Per-node step p99 across heterogeneous uplinks — 48-layer fixture (compute ≈ 0, 30 gen steps)
+
+The ADR-0009 **direct output**. A 48-MoE-barrier compute≈0 model (≡ Qwen layer
+count, hidden 8) makes each node's netem delay the whole per-fan signal. `per-node`
+= the `PlacedDispatch` send→gather round-trip for that node, per fanned layer-step.
+
+| B | agg tok/s | step median | step p99 | wire up / down (B) | node 0 p99 | node 1 p99 | node 2 p99 |
+|---|---|---|---|---|---|---|---|
+| 1 | 0.561 | 1.70 s | 1.98 s | 43,644 / 55,272 | **20.8 ms** | **61.4 ms** | **101.0 ms** |
+| 8 | 2.810 | 2.75 s | 2.91 s | 342,548 / 438,768 | 21.2 ms | 60.9 ms | 100.8 ms |
+
+Each node's p99 tracks its shaped one-way delay (20 / 60 / 100 ms) to within ~1 ms
+— the heterogeneous per-node tail M4 exists to produce. Aggregate step p99 (1.98 s
+at B=1) is well under the naïve `sum` of the three nodes' delays × 48 layers,
+because the concurrent fan overlaps them AND placement keeps most layer-steps on
+the fast node — the step is dominated by node 0's 20 ms, not node 2's 100 ms.
+
+> **p99 sample-count caveat (bench honesty):** node 0 (hot, contacted almost every
+> layer-step) has a populated tail (~1,400 samples over 31 forwards × 48 layers);
+> the sparse nodes 1/2 accrue only the layer-steps that route their cold-tail
+> experts, so their p99 is over fewer samples (tens–hundreds) — read it as
+> "worst-of-n", not a fully-populated tail, exactly as the M3 hedge caveat.
+
+### Per-node step p99 — real-model anchor (Qwen3-30B-A3B, fp8, B ∈ {1,8}, 2 priming forwards)
+
+At real payload/compute scale the per-node time is `netem delay + real fp8
+activation transfer + the node's expert compute` — the netem delay is now the
+small term and the compute on node 0 (5,336 held experts) dominates. `p99` here is
+worst-of-≈2 forwards (a coarse anchor, not a tail — the plan's budget cap).
+
+| B | step median | step p99 | wire up / down (B) | node 0 p99 | node 1 p99 | node 2 p99 |
+|---|---|---|---|---|---|---|
+| 1 | 17.89 s | 17.89 s | 364,228 / 1,577,280 | 684 ms | 574 ms | 447 ms |
+| 8 | 103.08 s | 103.08 s | 2,832,560 / 12,617,772 | 2.2 s | 2.2 s | 2.2 s |
+
+The placed path runs the real model end-to-end across three shaped nodes on the
+existing wire; the per-node times converge at B=8 (all nodes saturated on compute,
+the 20/60/100 ms shaping is a rounding error against seconds of fp8 forward). The
+un-tuned dense forward is the wall-clock (~9 s/forward, the M1/M3 figure);
+forward-perf tuning stays out of scope as in M1–M3.
+
+### Dashboard numbers landed this milestone
+
+- **#1 batch depth** — the `B` streams advanced in lockstep (M2/M3 `GenStats`),
+  here 1 and 8 across the placed pool; aggregate tok/s is the product line above.
+- **#4 per-node step p99** — the tables above (the placement-relevant number).
+
+The remaining M4 dashboard numbers land in the following M4 PRs, not this one:
+**#5 prefix-cache hit-rate** (ADR-0022 identity primitive) and the **perplexity
+canary Δppl** (ADR-0008 / ADR-0018); **#2 KV occupancy** is a derived
+`B × ctx × layers × kv_elem` from the existing `LayerKv` reported alongside them.
+
+### Deferred — real-party numbers (#6 stays open)
+
+Everything above is a SIMULATION on one host. Its assumptions, continued from
+M1–M3: netem-emulated per-link delay+rate on `lo` (no real ISP/geography); a
+single failure domain per IP with NO correlated churn; shaped-but-synthetic
+uplinks; the spine→node egress shaped and the return unshaped; and — for the
+per-node p99 — a worst-of-n tail on the sparse nodes, not a populated one. What the
+real party must show that the sim cannot: a **populated** WAN tail on genuine
+geography, **correlated-churn** behaviour (households/ISPs dying together), and the
+ADR-0006 critical-mass crossover. #6 closes when a human lands those.
+
+**Promote sim → real (same binaries, only addresses change):** on each real box
+`kenny node --carved <dir> --hold <subset> --listen 0.0.0.0:<port>` (the `<subset>`
+is that node's `PlacementMap::subset_for` assignment; `--shard i/n` is the
+no-placement-file convenience); on the spine box `kenny spine --carved <dir>
+--model <model_dir> --node <box1> --node <box2> --node <box3> [--replicas r]
+[--hedge-ms N] --batch <B>`. Preconditions are #4's: the SAME kenny build on every
+box (⇒ identical `WIRE_VERSION` + codec versions), the same fp8 carve so the
+handshake `verify` passes, x86/LE, and port reachability — plus REAL
+failure-domain labels in the placement input so replicas land in genuinely distinct
+churn domains.
+
+### Reproduce
+
+```
+# Fixture arm (model-free): 3 heterogeneously-shaped nodes, per-node p99.
+bash tools/netem-bench.sh --nodes 3 --placement
+# More gen steps for a fuller per-node tail:
+KENNY_NETEM_STEPS=30 bash tools/netem-bench.sh --nodes 3 --placement
+
+# Real-model anchor (Qwen3-30B-A3B): placed across 3 shaped nodes, B ∈ {1,8}.
+KENNY_MODEL_DIR=<model_dir> bash tools/netem-bench.sh --nodes 3 --placement
+
+# Unprivileged netns (unshare -rn); unavailable ⇒ "netns unavailable" + exit 0.
+# A plain `cargo test` never touches netem (netem_placement gates on
+# KENNY_NETEM_NODES). The CI-runnable locks (no netns, no model) are
+# tests/dispatch.rs::placed_* + placed_records_per_node_latency and
+# node::apply_hold_* — placed ≡ local bit-exact, the shard partition, per-node
+# latency plumbing — all in `cargo test`.
+```
