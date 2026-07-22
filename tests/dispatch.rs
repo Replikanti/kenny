@@ -209,11 +209,12 @@ fn renorm_over_answered_subset() {
     // Three of layer 0's four replicas are down; only expert 3 survives there.
     let lost = [(0u16, 0u16), (0, 1), (0, 2)];
 
-    let (_all, all_stats) = via_local(&spine, &carved, "bf16", &prompt, 6, &[]);
+    let tokens = 6usize;
+    let (_all, all_stats) = via_local(&spine, &carved, "bf16", &prompt, tokens, &[]);
     assert_eq!(all_stats.renorm_steps, 0, "nothing missing -> no renorm");
 
-    let (drop_local, drop_stats) = via_local(&spine, &carved, "bf16", &prompt, 6, &lost);
-    let (drop_node, _) = via_node(&spine, &carved, "bf16", &prompt, 6, &lost);
+    let (drop_local, drop_stats) = via_local(&spine, &carved, "bf16", &prompt, tokens, &lost);
+    let (drop_node, node_stats) = via_node(&spine, &carved, "bf16", &prompt, tokens, &lost);
 
     assert_eq!(drop_local, drop_node, "renorm path: local must equal node");
     // The run is observably a renorm run (all-present had zero renorm steps).
@@ -225,6 +226,42 @@ fn renorm_over_answered_subset() {
     assert!(
         drop_local.iter().all(|&t| (t as usize) < spine.vocab()),
         "renormed output stays finite / in-vocab"
+    );
+
+    // Down-byte accounting for the answered<k (replica-loss) branch (PR #17
+    // follow-up): a not-held expert returns a record HEADER but NO y payload, so
+    // the down stream is exactly the all-present down MINUS the missing experts'
+    // y payloads — the asymmetry the not-held path exists to produce. top_k =
+    // experts here, so every one of the k replicas is routed every step; layer 0
+    // holds only 1 of its 4 (three dropped), every other MoE layer holds all k.
+    let elem = make_codec("bf16").elem_bytes();
+    let payload = (hidden * elem) as u64; // one encoded y = hidden * codec_bytes
+    let k = spine.experts_per_step() as u64;
+    let moe_layers = manifest.model.moe_layers as u64;
+    let forwards = (prompt.len() + tokens - 1) as u64;
+    let dispatches = forwards * moe_layers;
+    // Every dispatch carries the gather header + one record header per requested
+    // expert (present or not); only ANSWERED experts add a y payload.
+    let frame = dispatches * (GATHER_HEADER_LEN as u64 + GATHER_RECORD_HEADER_LEN as u64 * k);
+    // Answered y payloads: 1 on layer 0 (only the surviving replica), k on each
+    // of the remaining MoE layers.
+    let answered_ys = forwards * (1 + k * (moe_layers - 1));
+    let expect_down = frame + answered_ys * payload;
+    assert_eq!(
+        node_stats.wire_down, expect_down,
+        "renorm down bytes: header per requested expert, y only for the answered ones"
+    );
+    // And it is strictly fewer down bytes than an all-present run would carry:
+    // the (k - 1) dropped replicas of layer 0 each drop one y payload per forward.
+    let all_present_down = frame + forwards * k * moe_layers * payload;
+    assert!(
+        node_stats.wire_down < all_present_down,
+        "the replica loss must SHRINK the down stream by the missing y payloads"
+    );
+    assert_eq!(
+        all_present_down - node_stats.wire_down,
+        forwards * (k - 1) * payload,
+        "the down-byte shortfall equals exactly the missing experts' y payloads"
     );
 }
 
@@ -327,5 +364,200 @@ fn two_process_cli_smoke() {
     assert!(
         stdout.contains("wire:"),
         "stats missing wire bytes:\n{stdout}"
+    );
+}
+
+// -------------------------------------------------------------------------
+// S7 — the M1 exit criterion, against the REAL Qwen3-30B-A3B (KENNY_MODEL_DIR).
+// CI never downloads a model, so this is gated; it is the demonstration the
+// milestone closes on. Two things are proven: (1) the distributed fp8 path
+// (fp8 blobs + fp8 wire) reproduces the in-process path bit-for-bit on the real
+// model — the same protocol self-consistency gate the fixture proves, now with
+// real numerics — and (2) an OUTPUT-SANITY cosine of the fp8-dispatched logits
+// vs a reference forward that reads the ORIGINAL bf16 weights (no blob quant, no
+// codec — the diff.rs::source_matrix path, A6), the first end-to-end ADR-0018
+// signal that mirrors M0's fp8-vs-bf16 methodology.
+// -------------------------------------------------------------------------
+
+use kenny::spine::Dispatcher;
+use kenny::{expert, quant, safetensors};
+use std::collections::BTreeMap;
+
+/// Reference dispatcher (A6): every expert reconstructed from the ORIGINAL bf16
+/// model tensors, run with NO quantization and NO wire codec — the exact
+/// `diff.rs::source_matrix` reference M0 measured fp8 against. It holds every
+/// expert, so it never answers not-held. Shards are mmapped and cached.
+struct SourceDispatch {
+    dir: PathBuf,
+    tensor_shard: BTreeMap<String, String>,
+    shards: BTreeMap<String, safetensors::ShardFile>,
+    hidden: usize,
+    inter: usize,
+}
+
+impl SourceDispatch {
+    fn new(model_dir: &Path, hidden: usize, inter: usize) -> SourceDispatch {
+        let model = safetensors::open_model(model_dir).unwrap();
+        let tensor_shard = model.weight_map.iter().cloned().collect();
+        SourceDispatch {
+            dir: model.dir,
+            tensor_shard,
+            shards: BTreeMap::new(),
+            hidden,
+            inter,
+        }
+    }
+
+    fn matrix(&mut self, layer: u16, expert: u16, proj: &str) -> Vec<f32> {
+        let name = format!("model.layers.{layer}.mlp.experts.{expert}.{proj}.weight");
+        let shard_name = self.tensor_shard[&name].clone();
+        let shard = self
+            .shards
+            .entry(shard_name.clone())
+            .or_insert_with(|| safetensors::ShardFile::open(&self.dir.join(&shard_name)).unwrap());
+        let meta = shard.tensor(&name).unwrap();
+        quant::bf16_to_f32_vec(shard.bytes(meta)).unwrap()
+    }
+}
+
+impl Dispatcher for SourceDispatch {
+    fn dispatch(
+        &mut self,
+        layer: u16,
+        x: &[f32],
+        experts: &[u16],
+    ) -> kenny::error::Result<Vec<Option<Vec<f32>>>> {
+        let hidden = self.hidden;
+        let mut out = Vec::with_capacity(experts.len());
+        for &e in experts {
+            let gate = self.matrix(layer, e, "gate_proj");
+            let up = self.matrix(layer, e, "up_proj");
+            let down = self.matrix(layer, e, "down_proj");
+            let mut y = vec![0f32; hidden];
+            expert::forward(&gate, &up, &down, hidden, x, &mut y);
+            out.push(Some(y));
+        }
+        let _ = self.inter;
+        Ok(out)
+    }
+}
+
+fn cosine(a: &[f32], b: &[f32]) -> f64 {
+    let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+    for (&x, &y) in a.iter().zip(b) {
+        dot += x as f64 * y as f64;
+        na += x as f64 * x as f64;
+        nb += y as f64 * y as f64;
+    }
+    if na == 0.0 || nb == 0.0 {
+        return 0.0;
+    }
+    dot / (na.sqrt() * nb.sqrt())
+}
+
+#[test]
+fn real_model_two_process_dispatch() {
+    let Some(dir) = std::env::var_os("KENNY_MODEL_DIR") else {
+        eprintln!("KENNY_MODEL_DIR unset — skipping S7 real-model two-process run");
+        return;
+    };
+    let model_dir = PathBuf::from(dir);
+
+    // fp8 carve of the real model (the node's blob store). Re-runs dedup-skip,
+    // so this is cheap on a warm carve.
+    let carved = Path::new(env!("CARGO_TARGET_TMPDIR")).join("real-carve-fp8");
+    std::fs::create_dir_all(&carved).unwrap();
+    let t0 = std::time::Instant::now();
+    let s = carve::run(
+        &model_dir,
+        &Options {
+            out: carved.clone(),
+            model_name: "qwen3-30b-a3b".into(),
+            model_rev: String::new(),
+            dtype: Dtype::Fp8,
+        },
+    )
+    .unwrap();
+    eprintln!(
+        "S7 fp8 carve: {} blobs ({} new bytes, {} dedup) in {:.1?}",
+        s.blobs,
+        s.blob_bytes,
+        s.dedup_skipped,
+        t0.elapsed()
+    );
+    assert_eq!(s.blobs, 6144, "Qwen3-30B-A3B routed expert count");
+    assert_eq!((s.moe_layers, s.experts_per_layer), (48, 128));
+
+    let manifest = Manifest::load(&carved.join(manifest::FILE_NAME)).unwrap();
+    let hidden = manifest.model.hidden as usize;
+    let inter = manifest.model.inter as usize;
+
+    // Real Qwen3-30B-A3B hyperparameters (the model card == Config::default()).
+    let cfg = Config::default();
+    let t_load = std::time::Instant::now();
+    let spine = Spine::load(&model_dir, &manifest, cfg).unwrap();
+    eprintln!(
+        "S7 spine load (always-on tensors): {:.1?}",
+        t_load.elapsed()
+    );
+
+    let prompt = [40u32, 1207, 264, 3405]; // arbitrary in-vocab ids
+    let gen_n = 8usize;
+
+    // (1) THE GATE on the real model: fp8 local ≡ fp8 node, bit-for-bit.
+    let (local, local_stats) = via_local(&spine, &carved, "fp8", &prompt, gen_n, &[]);
+    let (node, node_stats) = via_node(&spine, &carved, "fp8", &prompt, gen_n, &[]);
+    assert_eq!(
+        local, node,
+        "real model: dispatched fp8 path must reproduce the in-process path bit-for-bit"
+    );
+    assert!(
+        node_stats.wire_up > 0 && node_stats.wire_down > 0,
+        "wire moved"
+    );
+
+    let secs = node_stats.elapsed.as_secs_f64();
+    let tok_s = node_stats.generated_tokens as f64 / secs;
+    let wire_per_tok =
+        (node_stats.wire_up + node_stats.wire_down) as f64 / node_stats.generated_tokens as f64;
+    let (median, p99) = node_stats.latency_median_p99();
+    eprintln!(
+        "S7 two-process: {gen_n} tok in {secs:.3}s = {tok_s:.2} tok/s | per-forward median \
+         {median:.1?} p99 {p99:.1?} | wire up {} B down {} B ({wire_per_tok:.0} B/tok) | local {:.3}s",
+        node_stats.wire_up,
+        node_stats.wire_down,
+        local_stats.elapsed.as_secs_f64(),
+    );
+
+    // (2) OUTPUT SANITY (A6): fp8-dispatched logits vs a bf16-source reference
+    // (no blob quant, no wire codec), teacher-forced on the same prompt.
+    let mut fp8 = LocalDispatch::new(&carved, Box::new(Fp8Codec)).unwrap();
+    let logits_fp8 = spine.logits(&mut fp8, &prompt).unwrap();
+    let mut reference = SourceDispatch::new(&model_dir, hidden, inter);
+    let logits_ref = spine.logits(&mut reference, &prompt).unwrap();
+    let cos = cosine(&logits_fp8, &logits_ref);
+    eprintln!("S7 output-sanity cosine (fp8-blob+fp8-wire vs bf16-source): {cos:.6}");
+    // A loose floor only — this is a MEASURED signal for BENCH.md, not a tuned
+    // gate; the exact number is what the milestone reports.
+    assert!(
+        cos > 0.9,
+        "end-to-end fp8 forward degraded far past sanity: cosine {cos}"
+    );
+    // The greedy next token may or may not agree: a >0.999 cosine still perturbs
+    // a 151936-way argmax when the top candidates are close, so token-level match
+    // is NOT the quality gate (that is the deferred perplexity canary, ADR-0008).
+    // Print both argmaxes as an observation, assert nothing about their equality.
+    let arg = |v: &[f32]| {
+        v.iter()
+            .enumerate()
+            .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &x)| {
+                if x > bv { (i, x) } else { (bi, bv) }
+            })
+            .0
+    };
+    eprintln!(
+        "S7 next-token argmax: fp8 {} vs bf16-source {}",
+        arg(&logits_fp8),
+        arg(&logits_ref)
     );
 }
