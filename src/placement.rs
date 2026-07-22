@@ -147,7 +147,8 @@ pub struct NodeDesc {
 }
 
 /// `(layer, expert) -> replica set` (node indices into the `nodes` slice given
-/// to [`build_placement`], sorted ascending). Spine-local; consumed by
+/// to [`build_placement`], in PLACEMENT-PREFERENCE order: index 0 is the primary
+/// holder, index r the r-th hedge replica). Spine-local; consumed by
 /// `PlacedDispatch` and by the per-node `--hold` subset ([`Self::subset_for`]).
 #[derive(Debug, Default, Clone)]
 pub struct PlacementMap {
@@ -155,8 +156,9 @@ pub struct PlacementMap {
 }
 
 impl PlacementMap {
-    /// The replica set (sorted node indices) for one expert, or empty if the
-    /// expert is unplaced — the pre-existing not-held → renorm path (ADR-0008).
+    /// The replica set for one expert in preference order (index 0 = primary, the
+    /// round-0 holder), or empty if the expert is unplaced — the pre-existing
+    /// not-held → renorm path (ADR-0008).
     pub fn replicas_of(&self, layer: u16, expert: u16) -> &[usize] {
         self.replicas
             .get(&(layer, expert))
@@ -309,7 +311,11 @@ pub fn build_placement(nodes: &[NodeDesc], heat: &HeatMap, r: usize) -> Result<P
                 None => break,
             }
         }
-        chosen.sort_unstable();
+        // `chosen` is in PLACEMENT-PREFERENCE order: index 0 is the primary (the
+        // round-0 holder `PlacedDispatch` dispatches to), index r the r-th hedge
+        // replica. It must NOT be sorted by node index — doing so would collapse
+        // every expert's primary onto the lowest-index node and defeat the
+        // ADR-0009 step-time equalization the `better` order computes.
         replicas.insert(key, chosen);
     }
 
@@ -463,6 +469,56 @@ mod tests {
             used[reps[0]] = true;
         }
         assert!(used.iter().all(|&u| u), "bootstrap touches every node");
+    }
+
+    #[test]
+    fn primaries_spread_across_the_pool_not_the_lowest_index() {
+        // FINDING-1 regression: the replica set must be stored in preference
+        // order, NOT sorted by node index — otherwise replicas_of[0] (the primary
+        // PlacedDispatch dispatches to on the unhedged path) is always the
+        // lowest-index node and ALL traffic collapses there. Uniform cold catalog
+        // over 3 nodes, r=2: the primary must land on EVERY node (rendezvous
+        // spread), so no node carries zero primary traffic.
+        let nodes = [
+            node("n0", "A", 10, 10),
+            node("n1", "B", 10, 10),
+            node("n2", "C", 10, 10),
+        ];
+        let mut heat = HeatMap::new();
+        for e in 0..30u16 {
+            heat.touch(0, e);
+        }
+        let map = build_placement(&nodes, &heat, 2).unwrap();
+        let mut primary_used = [false; 3];
+        for e in 0..30u16 {
+            let reps = map.replicas_of(0, e);
+            assert_eq!(reps.len(), 2, "r=2 over 3 distinct domains");
+            primary_used[reps[0]] = true;
+        }
+        assert!(
+            primary_used.iter().all(|&u| u),
+            "every node must be primary for some expert (no lowest-index collapse): {primary_used:?}"
+        );
+    }
+
+    #[test]
+    fn primary_is_the_preferred_replica_not_the_lowest_index() {
+        // The fat-uplink node (index 2) must be the PRIMARY of a hot expert even
+        // though it is the highest-index node — the sort-away bug would have put
+        // node 0 first regardless of the `better` preference.
+        let nodes = [
+            node("slow0", "A", 10, 10),
+            node("slow1", "B", 10, 10),
+            node("fat2", "C", 100, 10),
+        ];
+        let heat = hot((0, 0), 1000);
+        let map = build_placement(&nodes, &heat, 2).unwrap();
+        let reps = map.replicas_of(0, 0);
+        assert_eq!(reps.len(), 2);
+        assert_eq!(
+            reps[0], 2,
+            "the fat-uplink node is the primary (index 0 of the replica set), not node 0"
+        );
     }
 
     #[test]

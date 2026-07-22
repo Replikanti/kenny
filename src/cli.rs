@@ -53,7 +53,7 @@ USAGE:
                 [--tokens N] [--prompt id,id,...] [--batch N] [--codec fp8|bf16]
                 [--seed N] [--num-heads N] [--num-kv-heads N] [--head-dim N]
                 [--rope-theta N] [--rms-eps-ppm N] [--top-k N] [--layer-timeout-ms N]
-                [--replicas N]
+                [--replicas N] [--hedge-ms N]
         Run the Qwen3-30B-A3B spine-sim (ADR-0020): a pure-Rust dense forward
         whose MoE FFN is dispatched to a node (--node) or run in-process
         (--local). Reads the always-on tensors from <model_dir> by the manifest's
@@ -74,7 +74,10 @@ USAGE:
         expert replicated --replicas N ways — default 2, clamped to the node
         count), each holder gets its sub-list on the existing wire (no frame
         change), and an expert no node holds renorms. Dead replicas surface on the
-        ADR-0008 alarm at the end of the run.
+        ADR-0008 alarm at the end of the run. --hedge-ms N arms the ADR-0010
+        replica-set hedge on the placed path: a stalled primary's experts spill to
+        their next replica, first-answer-wins (the multi-node analogue of the
+        single-node --layer-timeout-ms; default off).
 ";
 
 pub fn run(args: &[String]) -> Result<()> {
@@ -351,6 +354,7 @@ fn run_spine(args: &[String]) -> Result<()> {
     let mut rms_eps_ppm = 1u64; // 1e-6
     let mut layer_timeout_ms: Option<u64> = None;
     let mut replicas = 2usize; // ADR-0009 default r; clamped to the node count
+    let mut hedge_ms: Option<u64> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -424,6 +428,14 @@ fn run_spine(args: &[String]) -> Result<()> {
                 replicas = parse_num(value(args, &mut i, "--replicas")?, "--replicas", 1, 1 << 16)?
                     as usize;
             }
+            "--hedge-ms" => {
+                hedge_ms = Some(parse_num(
+                    value(args, &mut i, "--hedge-ms")?,
+                    "--hedge-ms",
+                    1,
+                    1 << 30,
+                )?);
+            }
             other => {
                 return Err(Error::usage(format!(
                     "spine: unexpected argument {other:?}"
@@ -482,6 +494,14 @@ fn run_spine(args: &[String]) -> Result<()> {
     };
     let prompt_refs: Vec<&[u32]> = prompts.iter().map(Vec::as_slice).collect();
 
+    // The replica-set hedge (ADR-0010) is a multi-node knob only: a single node
+    // has no second replica, so single-node tail latency is --layer-timeout-ms.
+    if hedge_ms.is_some() && nodes.len() < 2 {
+        return Err(Error::usage(
+            "spine: --hedge-ms applies to multi-node placed dispatch (2+ --node); \
+             single-node tail latency is --layer-timeout-ms",
+        ));
+    }
     let mut dispatcher: Box<dyn spine::Dispatcher> = if local {
         if layer_timeout_ms.is_some() {
             return Err(Error::usage(
@@ -498,10 +518,12 @@ fn run_spine(args: &[String]) -> Result<()> {
     } else {
         // Multi-node PLACED dispatch (ADR-0009 / ADR-0024). The per-layer timeout
         // is a single-node knob; multi-node tail latency is the ADR-0010
-        // replica-set hedge, so reject the mix rather than silently ignore it.
+        // replica-set hedge (--hedge-ms), so reject the mix rather than silently
+        // ignore it and point at the real mitigation.
         if layer_timeout_ms.is_some() {
             return Err(Error::usage(
-                "spine: --layer-timeout-ms is single-node; multi-node uses ADR-0009 placement",
+                "spine: --layer-timeout-ms is single-node; multi-node tail latency is the \
+                 ADR-0010 replica-set hedge — use --hedge-ms",
             ));
         }
         // Uniform consistent-hash bootstrap over the node set: no heat log exists
@@ -523,8 +545,16 @@ fn run_spine(args: &[String]) -> Result<()> {
             heat.touch(e.layer, e.expert);
         }
         let map = build_placement(&node_descs, &heat, replicas)?;
+        // --hedge-ms arms the replica-set second-send: a stalled primary's experts
+        // spill to their next replica, first-answer-wins (ADR-0010 on placement).
+        let hedge_delay = hedge_ms.map(std::time::Duration::from_millis);
         Box::new(PlacedDispatch::connect(
-            &nodes, make_codec, identity, hidden, map, None,
+            &nodes,
+            make_codec,
+            identity,
+            hidden,
+            map,
+            hedge_delay,
         )?)
     };
 

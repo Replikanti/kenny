@@ -1153,7 +1153,24 @@ fn placed_hedge_fires_to_second_replica() {
     let moe_layers = manifest.model.moe_layers as u64;
     let spine = Spine::load(&model, &manifest, config(hidden, 2)).unwrap();
     let all = all_expert_keys(&manifest);
-    let nodes = uniform_nodes(2);
+    // A skewed pool so node 0 (the fat uplink) is deterministically the PRIMARY of
+    // EVERY expert — the placement engine preserves preference order (not node
+    // index), so a black-holed node 0 forces the hedge on every layer-step. node 1
+    // is every expert's second replica and holds them all.
+    let nodes = [
+        NodeDesc {
+            id: "fat0".into(),
+            failure_domain: "d0".into(),
+            uplink_class: 1_000_000,
+            ram_class: 1,
+        },
+        NodeDesc {
+            id: "thin1".into(),
+            failure_domain: "d1".into(),
+            uplink_class: 1,
+            ram_class: 1,
+        },
+    ];
     let hedge_delay = Duration::from_millis(25); // paid once per layer (primary always stalls)
     let tokens = 4usize;
 
@@ -1162,8 +1179,19 @@ fn placed_hedge_fires_to_second_replica() {
         let forwards = (prompts[0].len() + tokens - 1) as u64;
         let expected_hedges = forwards * moe_layers;
         for which in ["fp8", "bf16"] {
-            let heat = bootstrap_heat(&all, &[]);
+            // Weight-1 heat so the fat uplink wins the primary for every expert.
+            let mut heat = HeatMap::new();
+            for &(l, e) in &all {
+                heat.record_dispatch(l, e);
+            }
             let map = build_placement(&nodes, &heat, 2).unwrap();
+            for &(l, e) in &all {
+                assert_eq!(
+                    map.replicas_of(l, e).first(),
+                    Some(&0),
+                    "node 0 (fat uplink) must be the primary of every expert"
+                );
+            }
             let (local, _) = via_local_batch(&spine, &carved, which, prompts, tokens, &[]);
             let (placed, pstats) = via_placed_batch(
                 &spine,
@@ -1283,8 +1311,11 @@ fn two_process_cli_smoke() {
 /// second `--node` (that was the M1 `nodes.len() > 1` gate) but builds a placed
 /// dispatch over both. Two real `kenny node` processes serve; the spine fans the
 /// routed experts across them per the ADR-0009 bootstrap placement and reports
-/// the placed topology. Proves the end-to-end multi-node path runs and stays on
-/// the existing wire.
+/// the placed topology. `--hedge-ms` is passed too, so this also asserts the
+/// ADR-0010 replica-set hedge is ARMABLE from the product path (an unwired flag
+/// would fail as an unexpected argument); with a healthy pool the primary wins
+/// and no hedge fires. Proves the end-to-end multi-node path runs on the existing
+/// wire.
 #[test]
 fn multi_node_placed_cli_smoke() {
     let root = tmp("cli-placed");
@@ -1333,6 +1364,8 @@ fn multi_node_placed_cli_smoke() {
             &addrs[1],
             "--replicas",
             "2",
+            "--hedge-ms",
+            "500",
             "--tokens",
             "3",
             "--batch",
