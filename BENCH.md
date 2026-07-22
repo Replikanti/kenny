@@ -135,3 +135,103 @@ kenny node  --carved <fp8_carve>                       # prints `listening <addr
 kenny spine --carved <fp8_carve> --model <model_dir> --node <addr> \
     --codec fp8 --prompt 40,1207,264,3405 --tokens 8
 ```
+
+## M2 — localhost batching B-sweep (2026-07-22)
+
+The first batching data: aggregate tok/s and per-**step** latency as batch size
+`B` rises, with exact per-direction wire bytes. Batching composes on the M1 wire
+(ADR-0023) — a batched step issues `B` independent KNYD/KNYG frame pairs per MoE
+layer, no `WIRE_VERSION`/codec bump, `src/node.rs` untouched — so this measures
+the spine's `generate_batch` path, not a new protocol.
+
+**Topology is LOOPBACK, not a real LAN.** `spine ⇄ 127.0.0.1 ⇄ node`, one box:
+the node runs as a serve loop over a loopback TCP socket (the S7 two-process
+harness), same machine as M0–M1 (i7-1355U / 12 threads, 30 GiB RAM, KIOXIA
+KXG8AZNV1T02 NVMe, Fedora 7.1.3, rustc 1.95.0, release build). Model:
+Qwen3-30B-A3B, fp8-carved (6,144 blobs, 29,079,257,088 blob bytes; cold carve
+69.3 s, spine always-on load 3.3 s). Greedy decode, **rectangular** batch of `B`
+seed-derived independent streams, prompt 2 tokens → 2 generated each (3 forward
+passes/stream), top-k 8, 48 MoE layers, fp8 blobs + fp8 wire.
+
+### Throughput vs batch size — aggregate, localhost, greedy
+
+| B | tok/s (aggregate) | per-step median | per-step p99 | up (B) | down (B) | total (B) |
+|---|---|---|---|---|---|---|
+| 1 | 0.078 | 8.62 s | 8.90 s | 298,988 | 2,364,480 | 2,663,468 |
+| 2 | 0.087 | 15.20 s | 16.02 s | 597,932 | 4,728,960 | 5,326,892 |
+| 4 | 0.090 | 29.51 s | 30.81 s | 1,195,820 | 9,457,920 | 10,653,740 |
+| 8 | 0.092 | 58.04 s | 59.39 s | 2,391,596 | 18,915,840 | 21,307,436 |
+| 16 | 0.092 | 118.13 s | 118.78 s | 4,783,148 | 37,831,680 | 42,614,828 |
+| 32 | 0.092 | 236.15 s | 237.52 s | 9,566,252 | 75,663,360 | 85,229,612 |
+| 64 | 0.094 | 460.77 s | 461.76 s | 19,132,460 | 151,326,720 | 170,459,180 |
+
+The headline finding: **aggregate tok/s is ~flat (0.078 → 0.094) across a 64×
+batch range** — it does NOT scale with `B`. If batching amortized a real barrier
+it would trend toward `0.078 × B` (≈ 5 tok/s at B = 64); instead per-step wall
+time doubles with every doubling of `B` (8.6 → 15.2 → 29.5 → 58.0 → 118 → 236 →
+461 s), i.e. a batched step runs its `B` streams' dense forwards essentially
+serially. On localhost **RTT ≈ 0, so the MANIFESTO §4.4 per-layer round-trip
+barrier has nothing to amortize** — the only gain visible here is the modest ~20 %
+rise (fixed per-step overhead spread over more streams), and throughput stays
+bounded by the **un-tuned single-threaded dense pure-Rust forward** (a spine-sim,
+ADR-0020; forward-perf tuning and data-parallelism are out of scope, as in M1).
+This is the honest baseline the M3 `tc netem` run — and the real second-box LAN
+re-run — measure the amortization win against; the win is **unobservable at
+RTT ≈ 0 by construction**. Per-step median and p99 come from only 3 steps/stream
+(2 prime + 1 generate), so p99 here is effectively the slowest of three steps,
+not a populated tail percentile — a longer-run tail is deferred with the LAN
+numbers.
+
+> B = 128 is in the sweep code but its ~15-minute step did not complete in this
+> run (the process was stopped mid-B=128 under sustained CPU load); it is
+> deferred to the LAN re-run, where each step is the same CPU-bound cost. The
+> completed B ∈ {1…64} already span a 64× range and settle the flat-throughput
+> finding.
+
+### Wire — counted at the socket, per direction, reconciled to framing
+
+Batching adds **no new wire shape**: `D` independent dispatch/gather pairs, with
+`D = B × forwards × moe_layers = B × 3 × 48 = 144 B` here. With `hidden = 2048`,
+`elem = 1` B (fp8), `k = 8`:
+
+```
+up   = 44 + D × (12 + hidden·elem + 2k)       = 44 + 144B × 2,076
+down =       D × (12 + 3k + hidden·elem·k)     =      144B × 16,420
+```
+
+Worked at B = 64: `up = 44 + 9,216 × 2,076 = 19,132,460 B`,
+`down = 9,216 × 16,420 = 151,326,720 B` — matching the table exactly (the
+`batch_sweep_localhost` test asserts this reconciliation on every B). Per
+generated token the split is invariant in `B`: **up ≈ 149,472 B/tok, down
+1,182,240 B/tok** (down = 8× up, the top-k = 8 asymmetry of ADR-0011 / A5 — one
+`x` up per dispatch, one `y` down per answered expert). The `44 B` handshake is
+one-per-connection, so up/tok inches down from 149,494 (B = 1) toward the
+144B-term limit as `B` grows.
+
+### Deferred — real-LAN numbers (issue #4 stays open)
+
+The literal M2 ("node on a second physical box over LAN") is hardware-blocked:
+this host is the only machine on the LAN, so the numbers above are loopback. The
+§4.4 barrier-amortization win and **ADR-0006's critical-mass crossover claim
+require real latency and are NOT validated here** — deferred to (a) the M3
+`tc netem` injected-RTT run and (b) a genuine second-box re-run of the *same two
+binaries*, only addresses changing: `kenny node … --listen 0.0.0.0:<port>` on
+box B, `kenny spine … --node <boxB-ip>:<port> --batch <B>` on box A (holding the
+source model dir), with the same `batch_sweep_localhost` harness pointed at the
+remote address. Preconditions: identical kenny build (same `WIRE_VERSION` +
+codec versions) and the same fp8 carve on both (deterministic given the source,
+ADR-0012, so handshake `verify` passes), x86/LE, LAN reachability on the port.
+Only then is §4.4 measurable. #4 is closed by a human once those numbers land.
+
+### Reproduce
+
+```
+# Localhost B-sweep (gated; CI never downloads a model):
+KENNY_MODEL_DIR=<model_dir> cargo test --release --test dispatch \
+    batch_sweep_localhost -- --nocapture
+
+# By hand, one B:
+kenny node  --carved <fp8_carve>                       # prints `listening <addr>`
+kenny spine --carved <fp8_carve> --model <model_dir> --node <addr> \
+    --codec fp8 --batch <B> --tokens 2
+```
