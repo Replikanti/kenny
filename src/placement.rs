@@ -59,6 +59,16 @@ impl HeatMap {
         c.failures += 1;
     }
 
+    /// Note that an ALREADY-recorded dispatch of `(layer, expert)` failed —
+    /// bumps only `failures`, not `dispatches`. This is the counterpart to
+    /// [`Self::record_dispatch`] for the `PlacedDispatch` alarm feed, which
+    /// records every dispatch first and then marks the unanswered subset, so a
+    /// dispatch is never double-counted (`record_failure` bumps both and is for
+    /// callers that have not yet recorded the dispatch).
+    pub fn note_failure(&mut self, layer: u16, expert: u16) {
+        self.counts.entry((layer, expert)).or_default().failures += 1;
+    }
+
     /// Register an expert with zero counts so it enters the placement universe
     /// before it is ever dispatched — the ADR-0009 bootstrap seed (place the
     /// whole catalog cold, then let heat re-steer it as the log accumulates).
@@ -92,11 +102,20 @@ impl HeatMap {
     /// `num / den`. A fully dead replica set answers every dispatch with a
     /// failure, so it surfaces here for re-replication (ADR-0009). Integer
     /// comparison (`failures × den >= dispatches × num`) keeps it exact.
+    ///
+    /// A never-dispatched expert (`dispatches == 0`, e.g. one only [`touch`]ed
+    /// into the placement universe) is NEVER suspect regardless of `min_samples`:
+    /// with `min_samples = 0` the ratio test `0 × den >= 0 × num` is vacuously
+    /// true, so the explicit `dispatches > 0` guard keeps a cold 0/0 expert off
+    /// the dead-replica alarm — an unrouted expert is not a dead one.
+    ///
+    /// [`touch`]: Self::touch
     pub fn suspect(&self, min_samples: u64, num: u64, den: u64) -> Vec<ExpertKey> {
         self.counts
             .iter()
             .filter(|(_, c)| {
-                c.dispatches >= min_samples
+                c.dispatches > 0
+                    && c.dispatches >= min_samples
                     && (c.failures as u128) * (den as u128)
                         >= (c.dispatches as u128) * (num as u128)
             })
@@ -509,6 +528,50 @@ mod tests {
         // >= 50% failures over >= 5 samples: only the fully-dead (0,1) qualifies.
         let sus = heat.suspect(5, 1, 2);
         assert_eq!(sus, vec![(0, 1)]);
+    }
+
+    #[test]
+    fn suspect_never_flags_a_never_dispatched_expert() {
+        // A cold expert only `touch`ed into the universe (0 dispatches, 0
+        // failures) must never surface on the dead-replica alarm — not even at
+        // min_samples = 0, where the failure-ratio test is vacuously satisfied.
+        // Guards the M4 alarm consumer: an unrouted expert is not a dead one.
+        let mut heat = HeatMap::new();
+        heat.touch(4, 2); // 0 / 0
+        for _ in 0..3 {
+            heat.record_failure(4, 3); // 3 / 3, genuinely dead
+        }
+        assert!(
+            heat.suspect(0, 1, 1).contains(&(4, 3)),
+            "a 3/3 dead expert is suspect at any threshold"
+        );
+        assert!(
+            !heat.suspect(0, 1, 1).contains(&(4, 2)),
+            "a 0/0 never-dispatched expert is never suspect (min_samples = 0)"
+        );
+        assert!(
+            !heat.suspect(0, 0, 1).contains(&(4, 2)),
+            "even a >= 0 failure-fraction threshold cannot flag a 0-dispatch expert"
+        );
+    }
+
+    #[test]
+    fn note_failure_marks_only_failures() {
+        // The PlacedDispatch alarm feed records every dispatch, then marks the
+        // unanswered subset via note_failure — which must NOT re-count the
+        // dispatch (contrast record_failure, which bumps both).
+        let mut heat = HeatMap::new();
+        heat.record_dispatch(1, 0);
+        heat.record_dispatch(1, 0);
+        heat.note_failure(1, 0); // one of the two dispatches came back unanswered
+        assert_eq!(
+            heat.get(1, 0),
+            Counts {
+                dispatches: 2,
+                failures: 1
+            },
+            "note_failure bumps failures only, leaving the dispatch count intact"
+        );
     }
 
     #[test]

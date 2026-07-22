@@ -11,8 +11,9 @@ use crate::error::{Error, Result};
 use crate::fixture;
 use crate::manifest::{self, Manifest};
 use crate::node;
+use crate::placement::{HeatMap, NodeDesc, build_placement};
 use crate::rng::SplitMix64;
-use crate::spine::{self, Config, LocalDispatch, NodeDispatch, Spine};
+use crate::spine::{self, Config, LocalDispatch, NodeDispatch, PlacedDispatch, Spine};
 use crate::wire::{Bf16Codec, Fp8Codec, WireCodec};
 
 const USAGE: &str = "\
@@ -48,10 +49,11 @@ USAGE:
         127.0.0.1:0 (a fixed port is flaky under concurrency). Experts the node
         does not hold answer not-held (feeds the spine's renorm, ADR-0008).
 
-    kenny spine --carved <dir> --model <model_dir> (--node <addr> | --local)
+    kenny spine --carved <dir> --model <model_dir> (--node <addr>... | --local)
                 [--tokens N] [--prompt id,id,...] [--batch N] [--codec fp8|bf16]
                 [--seed N] [--num-heads N] [--num-kv-heads N] [--head-dim N]
                 [--rope-theta N] [--rms-eps-ppm N] [--top-k N] [--layer-timeout-ms N]
+                [--replicas N]
         Run the Qwen3-30B-A3B spine-sim (ADR-0020): a pure-Rust dense forward
         whose MoE FFN is dispatched to a node (--node) or run in-process
         (--local). Reads the always-on tensors from <model_dir> by the manifest's
@@ -63,9 +65,16 @@ USAGE:
         default to the Qwen3-30B-A3B card (head-dim 128 != hidden/num-heads;
         rope-theta 10000000; rms-eps-ppm 1 = 1e-6); the fixture (square attention)
         loads only at --num-heads 1 --num-kv-heads 1 --head-dim <hidden>.
-        --layer-timeout-ms N caps each MoE layer's wait on a --node (ADR-0010):
-        a straggler layer is dropped to the renorm (ADR-0008) and the connection
-        reconnected; default off (wait indefinitely, the M1/M2 behavior).
+        --layer-timeout-ms N caps each MoE layer's wait on a single --node
+        (ADR-0010): a straggler layer is dropped to the renorm (ADR-0008) and the
+        connection reconnected; default off (wait indefinitely, the M1/M2
+        behavior). Pass --node more than once for MULTI-NODE placed dispatch
+        (ADR-0009 / ADR-0024): the routed experts are fanned across the nodes by a
+        placement map (uniform consistent-hash bootstrap over the node set, each
+        expert replicated --replicas N ways — default 2, clamped to the node
+        count), each holder gets its sub-list on the existing wire (no frame
+        change), and an expert no node holds renorms. Dead replicas surface on the
+        ADR-0008 alarm at the end of the run.
 ";
 
 pub fn run(args: &[String]) -> Result<()> {
@@ -341,6 +350,7 @@ fn run_spine(args: &[String]) -> Result<()> {
     let mut cfg = Config::default();
     let mut rms_eps_ppm = 1u64; // 1e-6
     let mut layer_timeout_ms: Option<u64> = None;
+    let mut replicas = 2usize; // ADR-0009 default r; clamped to the node count
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -410,6 +420,10 @@ fn run_spine(args: &[String]) -> Result<()> {
                     1 << 30,
                 )?);
             }
+            "--replicas" => {
+                replicas = parse_num(value(args, &mut i, "--replicas")?, "--replicas", 1, 1 << 16)?
+                    as usize;
+            }
             other => {
                 return Err(Error::usage(format!(
                     "spine: unexpected argument {other:?}"
@@ -428,26 +442,25 @@ fn run_spine(args: &[String]) -> Result<()> {
             "spine: pass exactly one of --local or --node <addr>",
         ));
     }
-    if nodes.len() > 1 {
-        // Multi-node dispatch needs a placement/replication policy (ADR-0009),
-        // which is out of scope for M1's single-node two-process gate.
-        return Err(Error::usage(
-            "spine: M1 supports a single --node (multi-node placement is ADR-0009, post-M1)",
-        ));
-    }
-
     let manifest = Manifest::load(&carved.join(manifest::FILE_NAME))?;
     let identity = *blake3::hash(&manifest.canonical_bytes()).as_bytes();
     let hidden = manifest.model.hidden as usize;
     let spine = Spine::load(&model, &manifest, cfg)?;
 
-    let codec: Box<dyn WireCodec> = match codec_name.as_str() {
-        "fp8" => Box::new(Fp8Codec),
-        "bf16" => Box::new(Bf16Codec),
+    // Validate the codec up front, then hand out fresh boxes on demand — the
+    // multi-node placed path needs one codec instance per node connection.
+    match codec_name.as_str() {
+        "fp8" | "bf16" => {}
         other => {
             return Err(Error::usage(format!(
                 "spine: unknown --codec {other:?} (expected fp8 or bf16)"
             )));
+        }
+    }
+    let make_codec = || -> Box<dyn WireCodec> {
+        match codec_name.as_str() {
+            "bf16" => Box::new(Bf16Codec),
+            _ => Box::new(Fp8Codec),
         }
     };
 
@@ -475,21 +488,58 @@ fn run_spine(args: &[String]) -> Result<()> {
                 "spine: --layer-timeout-ms applies to --node dispatch, not --local",
             ));
         }
-        Box::new(LocalDispatch::new(&carved, codec)?)
-    } else {
-        let mut nd = NodeDispatch::connect(&nodes[0], codec, identity, hidden)?;
+        Box::new(LocalDispatch::new(&carved, make_codec())?)
+    } else if nodes.len() == 1 {
+        let mut nd = NodeDispatch::connect(&nodes[0], make_codec(), identity, hidden)?;
         if let Some(ms) = layer_timeout_ms {
             nd = nd.with_layer_timeout(std::time::Duration::from_millis(ms));
         }
         Box::new(nd)
+    } else {
+        // Multi-node PLACED dispatch (ADR-0009 / ADR-0024). The per-layer timeout
+        // is a single-node knob; multi-node tail latency is the ADR-0010
+        // replica-set hedge, so reject the mix rather than silently ignore it.
+        if layer_timeout_ms.is_some() {
+            return Err(Error::usage(
+                "spine: --layer-timeout-ms is single-node; multi-node uses ADR-0009 placement",
+            ));
+        }
+        // Uniform consistent-hash bootstrap over the node set: no heat log exists
+        // yet, so every node is an equal, distinct failure domain and every routed
+        // expert is seeded cold (ADR-0009 bootstrap). build_placement then spreads
+        // the catalog by rendezvous hash and replicates it `--replicas` ways
+        // (clamped to the node count).
+        let node_descs: Vec<NodeDesc> = nodes
+            .iter()
+            .map(|addr| NodeDesc {
+                id: addr.clone(),
+                failure_domain: addr.clone(),
+                uplink_class: 1,
+                ram_class: 1,
+            })
+            .collect();
+        let mut heat = HeatMap::new();
+        for e in &manifest.experts {
+            heat.touch(e.layer, e.expert);
+        }
+        let map = build_placement(&node_descs, &heat, replicas)?;
+        Box::new(PlacedDispatch::connect(
+            &nodes, make_codec, identity, hidden, map, None,
+        )?)
     };
 
     let (outs, stats) = spine.generate_batch(dispatcher.as_mut(), &prompt_refs, tokens)?;
 
     let where_ = if local {
         "local (in-process)".to_string()
-    } else {
+    } else if nodes.len() == 1 {
         format!("node {}", nodes[0])
+    } else {
+        format!(
+            "{} nodes placed (ADR-0009, r={})",
+            nodes.len(),
+            replicas.min(nodes.len())
+        )
     };
     let secs = stats.elapsed.as_secs_f64();
     let tok_s = if secs > 0.0 {
@@ -546,6 +596,20 @@ fn run_spine(args: &[String]) -> Result<()> {
         "speed:    {tok_s:.1} {rate} ({:.3} s); per-step median {:.1?}, p99 {:.1?}",
         secs, median, p99
     );
+    // ADR-0008 dead-replica alarm consumer: surface any expert whose holder(s)
+    // answered not-held on every dispatch (a placed multi-node run only).
+    let suspects = dispatcher.suspect_replicas();
+    if !suspects.is_empty() {
+        println!(
+            "alarm:    {} dead replica(s) (ADR-0008): {}",
+            suspects.len(),
+            suspects
+                .iter()
+                .map(|(l, e)| format!("L{l}/E{e}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     Ok(())
 }
 

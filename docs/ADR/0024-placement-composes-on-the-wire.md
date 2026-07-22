@@ -1,6 +1,6 @@
 # ADR-0024: Placement dispatch composes on the existing wire
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-07-22
 
 ## Context
@@ -80,6 +80,20 @@ byte-identical with `WIRE_VERSION == 1`, `PlacedDispatch` reproduces the
 `LocalDispatch` path bit-for-bit (`tests/dispatch.rs`), the placement-hole →
 renorm path is exercised, and the replica-set hedge is bit-exact and equals the
 no-hedge answer under no loss.
+
+**Accepted (M4, issue #6):** `PlacedDispatch` (`src/spine.rs`) fans routed
+experts across their holders per the `PlacementMap` and reassembles into routed
+order; the `kenny spine --node … --node …` multi-node hook replaced the
+single-node `nodes.len() > 1` rejection (`src/cli.rs`). The five wire goldens and
+`WIRE_VERSION == 1` are frozen, and `src/node.rs` is untouched. `tests/dispatch.rs`
+proves `placed_equals_local_bit_exact` (fan-out over distinct nodes), the
+placement-hole renorm (`placed_renorm_on_placement_hole`), and both the
+never-fired (`placed_hedge_equals_local_no_loss`) and fired
+(`placed_hedge_fires_to_second_replica`) replica-set hedge — all bit-for-bit
+`LocalDispatch`. The per-node `--hold` shard flag and the heterogeneous per-node
+p99 numbers land with the netns/netem sim (the next M4 PR); the concurrent
+split-stream pipeline is a throughput optimization deferred there too — neither
+changes the wire or the output.
 
 ## Alternatives considered
 

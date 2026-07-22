@@ -37,6 +37,26 @@ therefore not storage assignment; it IS the scheduler.
 - Placement quality is measurable: per-node step p99 (dashboard number 4) is its
   direct output.
 
+## Implementation status
+
+Implemented at M4 (issue #6):
+
+- The placement engine — the heat map, node descriptors, and `build_placement`
+  (r replicas across distinct failure domains, hot → fat-uplink, cold →
+  RAM-rich, equalize step *time*) — landed in `src/placement.rs`.
+- The consuming dispatch path — `PlacedDispatch` in `src/spine.rs`, which fans a
+  layer's routed experts across their holders per the `PlacementMap` and
+  reassembles per-expert into routed order — and the `kenny spine --node a --node
+  b …` multi-node CLI hook landed next, composing on the existing wire (ADR-0024,
+  no `WIRE_VERSION` change). The uniform consistent-hash bootstrap ("usable as a
+  bootstrap before the first heat map exists") is the CLI default when no heat
+  log is supplied; hedging (ADR-0010) is unified onto placement as a replica-set
+  second-send; the dispatch/failure heat log feeds the ADR-0008 dead-replica
+  alarm (`HeatMap::suspect`, `Dispatcher::suspect_replicas`).
+- Still deferred to the M4 real party (#6) and M5: the per-node p99 numbers
+  across *heterogeneous shaped* uplinks (the netns/netem sim), migration
+  machinery, co-activation clustering, and the L1 hot-expert spine cache.
+
 ## Alternatives considered
 
 - **Uniform random placement** — puts hot experts on DSL uplinks; tail latency
