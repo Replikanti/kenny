@@ -18,6 +18,7 @@ pub mod json;
 pub mod manifest;
 pub mod natsort;
 pub mod node;
+pub mod placement;
 pub mod quant;
 pub mod rng;
 pub mod safetensors;
