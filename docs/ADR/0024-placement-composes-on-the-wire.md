@@ -90,10 +90,21 @@ proves `placed_equals_local_bit_exact` (fan-out over distinct nodes), the
 placement-hole renorm (`placed_renorm_on_placement_hole`), and both the
 never-fired (`placed_hedge_equals_local_no_loss`) and fired
 (`placed_hedge_fires_to_second_replica`) replica-set hedge — all bit-for-bit
-`LocalDispatch`. The per-node `--hold` shard flag and the heterogeneous per-node
-p99 numbers land with the netns/netem sim (the next M4 PR); the concurrent
-split-stream pipeline is a throughput optimization deferred there too — neither
-changes the wire or the output.
+`LocalDispatch`.
+
+**Sim follow-up (M4, issue #6):** the netns/netem placement sim landed the three
+pieces this ADR deferred to it, none touching the wire or the output. The per-node
+`--hold` / `--shard` subset (`kenny node`, applied by dropping the complement from
+the index via `Node::drop_expert` — the serve loop and every wire golden stay
+byte-identical, a subset node just answers `not-held` more often) lets N nodes hold
+DISTINCT expert sets on one host. The concurrent split-stream is realized WITHOUT
+threads (which would force a `Send` bound onto `dyn WireCodec`): within a replica
+round every holding node's sends are hoisted ahead of the blocking reads, so the
+per-node round-trips OVERLAP and a placed step costs ≈ `max` over the nodes' RTTs,
+not their `sum` — which is what makes the ADR-0009 per-node step p99 spread across
+heterogeneous shaped uplinks (`tools/netem-bench.sh --nodes 3 --placement`)
+observable, its "direct output". `PlacedDispatch ≡ LocalDispatch` bit-for-bit still
+gates the reorder (hoisting sends reassembles nothing differently).
 
 ## Alternatives considered
 

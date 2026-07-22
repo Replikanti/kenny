@@ -614,6 +614,12 @@ impl NodeDispatch {
         })
     }
 
+    /// The node's dial address — used by `PlacedDispatch` to label per-node
+    /// latency series in the BENCH report.
+    pub fn addr(&self) -> &str {
+        &self.addr
+    }
+
     /// Arm this connection's receive deadline for the next gather(s).
     fn set_read_deadline(&self, deadline: Duration) {
         let _ = self.transport.get_ref().set_read_timeout(Some(deadline));
@@ -978,12 +984,20 @@ type NodeWork = Vec<(usize, SubList)>;
 /// counters are all spine-LOCAL (ADR-0004): never on the wire, never in a
 /// manifest, never cross-node.
 ///
-/// Fan-out talks to each holding node in turn (send its sub-lists, then read
-/// them): the placement anchor runs at small `B` and each node's share is a
-/// fraction of the routed set, so send-all-then-read per node is deadlock-free
-/// here — the same posture `HedgedDispatch` takes. The concurrent split-stream
-/// pipeline (per-node writer threads, ADR-0023) is a throughput optimization the
-/// simulated-WAN sim (a later M4 PR) can layer on; it does not change the output.
+/// Fan-out is a CONCURRENT split-stream (ADR-0024, the sim PR's layer on
+/// ADR-0023): within a replica round every holding node's sub-lists are sent
+/// FIRST (one buffered `Dispatch` write per stream, all nodes), then the gathers
+/// are read back — so the per-node round-trips OVERLAP and a placed step costs
+/// about `max` over the nodes' RTTs, not their `sum`. That overlap is what makes
+/// the ADR-0009 claim ("placement equalizes step *time* across heterogeneous
+/// uplinks") observable: with a serial fan the step would be the sum and load
+/// balancing could never shorten it. No threads are spawned (that would force a
+/// `Send` bound onto `dyn WireCodec`); the overlap comes purely from hoisting the
+/// sends ahead of the blocking reads, so each connection stays a plain sync-TCP
+/// `NodeDispatch` (ADR-0016). The anchor runs at small `B` and each node's share
+/// is a fraction of the routed set, so send-all-then-read is deadlock-free — the
+/// same posture `HedgedDispatch` and the composed-wire batch take. Output is
+/// bit-identical to `LocalDispatch`: hoisting sends reorders no reassembly.
 pub struct PlacedDispatch {
     nodes: Vec<NodeDispatch>,
     map: PlacementMap,
@@ -998,6 +1012,11 @@ pub struct PlacedDispatch {
     /// Layer-steps on which the hedge fired (a replica-set second-send ran) —
     /// read into `GenStats` at the end of a run, like `HedgedDispatch`.
     hedges_fired: u64,
+    /// Per-node measured round-trip of each fan (send-complete → gather-complete),
+    /// indexed by node. The per-node step-latency series ADR-0009 names as its
+    /// "direct output" — read by the netns/netem sim to report per-node p99 across
+    /// heterogeneous shaped uplinks. Spine-local, never on the wire.
+    per_node_lat: Vec<Vec<Duration>>,
 }
 
 impl PlacedDispatch {
@@ -1023,13 +1042,30 @@ impl PlacedDispatch {
         for addr in addrs {
             nodes.push(NodeDispatch::connect(addr, make_codec(), identity, hidden)?);
         }
+        let n = nodes.len();
         Ok(PlacedDispatch {
             nodes,
             map,
             heat: HeatMap::new(),
             hedge_delay: hedge_delay.map(|d| d.max(Duration::from_millis(1))),
             hedges_fired: 0,
+            per_node_lat: vec![Vec::new(); n],
         })
+    }
+
+    /// The per-node round-trip series measured over the run, indexed by node (the
+    /// same order as the `addrs` given to [`Self::connect`]). Each entry is one
+    /// fan's send→gather wall time; `per_node_latencies()[j]` is node `j`'s
+    /// per-step latency samples, whose p99 is the ADR-0009 per-node step p99. Read
+    /// by the netns/netem sim after a run.
+    pub fn per_node_latencies(&self) -> &[Vec<Duration>] {
+        &self.per_node_lat
+    }
+
+    /// The dial addresses, in node-index order — labels for the per-node latency
+    /// series in the BENCH report.
+    pub fn node_addrs(&self) -> Vec<String> {
+        self.nodes.iter().map(|n| n.addr().to_string()).collect()
     }
 
     /// The spine-local dispatch heat accumulated over this placed run: the
@@ -1039,47 +1075,69 @@ impl PlacedDispatch {
         &self.heat
     }
 
-    /// Send this node its sub-lists (one `Dispatch` frame per stream) then read
-    /// the gathers back in send order, filling answered `y`s into `out` at their
-    /// routed positions. A stalled read head-of-line-blocks the rest on this one
-    /// connection, so the tail is left unanswered (it spills to the next replica
-    /// round, or renorms) and the desynced connection is torn down + reconnected.
-    /// With no `deadline` armed the reads block (the unhedged path never stalls).
-    fn fan_to_node(
+    /// Phase 1 of the concurrent fan: write this node its sub-lists (one buffered
+    /// `Dispatch` frame per stream) WITHOUT reading — hoisting every node's sends
+    /// ahead of any blocking read is what overlaps the per-node round-trips.
+    fn send_to_node(
         &mut self,
         layer: u16,
         node_idx: usize,
         work: &NodeWork,
         items: &[(&[f32], &[u16])],
-        deadline: Option<Duration>,
-        out: &mut [Vec<Option<Vec<f32>>>],
     ) -> Result<()> {
         let nd = &mut self.nodes[node_idx];
         for (i, sub) in work {
             let experts: Vec<u16> = sub.iter().map(|&(_p, e)| e).collect();
             nd.send_one(layer, items[*i].0, &experts)?;
         }
-        if let Some(d) = deadline {
-            nd.set_read_deadline(d);
-        }
-        let mut stalled = false;
-        for (i, sub) in work {
-            if stalled {
-                continue;
+        Ok(())
+    }
+
+    /// Phase 2 of the concurrent fan: read this node's gathers back in send order,
+    /// filling answered `y`s into `out` at their routed positions, and record the
+    /// per-node round-trip (`sent` → now) into `per_node_lat`. A stalled read
+    /// head-of-line-blocks the rest on this one connection, so the tail is left
+    /// unanswered (it spills to the next replica round, or renorms) and the
+    /// desynced connection is torn down + reconnected. With no `deadline` armed the
+    /// reads block (the unhedged path never stalls). The response was already in
+    /// flight from the phase-1 send, so this read overlaps the other nodes' reads.
+    fn read_from_node(
+        &mut self,
+        node_idx: usize,
+        work: &NodeWork,
+        deadline: Option<Duration>,
+        sent: Instant,
+        out: &mut [Vec<Option<Vec<f32>>>],
+    ) -> Result<()> {
+        let elapsed;
+        let stalled;
+        {
+            let nd = &mut self.nodes[node_idx];
+            if let Some(d) = deadline {
+                nd.set_read_deadline(d);
             }
-            let experts: Vec<u16> = sub.iter().map(|&(_p, e)| e).collect();
-            match nd.recv_gather_opt(&experts)? {
-                Some(ys) => {
-                    for ((pos, _e), y) in sub.iter().zip(ys) {
-                        out[*i][*pos] = y;
-                    }
+            let mut s = false;
+            for (i, sub) in work {
+                if s {
+                    continue;
                 }
-                None => stalled = true,
+                let experts: Vec<u16> = sub.iter().map(|&(_p, e)| e).collect();
+                match nd.recv_gather_opt(&experts)? {
+                    Some(ys) => {
+                        for ((pos, _e), y) in sub.iter().zip(ys) {
+                            out[*i][*pos] = y;
+                        }
+                    }
+                    None => s = true,
+                }
+            }
+            elapsed = sent.elapsed();
+            stalled = s;
+            if stalled {
+                nd.reconnect()?;
             }
         }
-        if stalled {
-            nd.reconnect()?;
-        }
+        self.per_node_lat[node_idx].push(elapsed);
         Ok(())
     }
 }
@@ -1147,8 +1205,16 @@ impl Dispatcher for PlacedDispatch {
                 }
             });
             let node_work: Vec<(usize, NodeWork)> = by_node.into_iter().collect();
-            for (node_idx, work) in node_work {
-                self.fan_to_node(layer, node_idx, &work, items, deadline, &mut out)?;
+            // Concurrent split-stream: send to every node first (phase 1), then
+            // read every node back (phase 2), so the per-node round-trips overlap
+            // and the round costs ≈ max over the nodes, not their sum.
+            let mut sent_at: Vec<Instant> = Vec::with_capacity(node_work.len());
+            for (node_idx, work) in &node_work {
+                self.send_to_node(layer, *node_idx, work, items)?;
+                sent_at.push(Instant::now());
+            }
+            for ((node_idx, work), sent) in node_work.iter().zip(sent_at) {
+                self.read_from_node(*node_idx, work, deadline, sent, &mut out)?;
             }
             if self.hedge_delay.is_none() {
                 break; // no hedge: one primary round, a straggler renorms

@@ -53,9 +53,17 @@ Implemented at M4 (issue #6):
   log is supplied; hedging (ADR-0010) is unified onto placement as a replica-set
   second-send; the dispatch/failure heat log feeds the ADR-0008 dead-replica
   alarm (`HeatMap::suspect`, `Dispatcher::suspect_replicas`).
-- Still deferred to the M4 real party (#6) and M5: the per-node p99 numbers
-  across *heterogeneous shaped* uplinks (the netns/netem sim), migration
-  machinery, co-activation clustering, and the L1 hot-expert spine cache.
+- The per-node step p99 across *heterogeneous shaped* uplinks — this ADR's
+  "direct output" — is measured by the netns/netem placement sim
+  (`tools/netem-bench.sh --nodes 3 --placement`): N `kenny` nodes bound to
+  distinct loopback IPs, each behind its own `tc netem delay+rate` band, each
+  holding its `build_placement` subset (`kenny node --hold`/`--shard`), fanned by
+  a concurrent `PlacedDispatch`. The BENCH numbers (per-node p99 spread tracking
+  the shaped delays; hot experts landing on the fat uplinks) are the first real
+  evidence the placement objective works; they are honestly labelled SIMULATION.
+- Still deferred to the M4 real party (#6) and M5: a *real*-geography per-node
+  tail (populated, correlated churn, the ADR-0006 critical-mass crossover),
+  migration machinery, co-activation clustering, and the L1 hot-expert spine cache.
 
 ## Alternatives considered
 
