@@ -203,6 +203,10 @@ occupancy · per-node step p99 · perplexity canary.
   end-to-end.
 - **M5 — elasticity**: join/leave, migration, failure domains; then verification
   spot-checks (ADR-0015). Then, and only then, GLM-5.2 on a ~20-node party.
+  M5.A (elasticity) + M5.B (verification spot-checks) shipped on Qwen3 / sim /
+  fixtures; the GLM machinery (shared-expert, DSA, MTP) stays design (ADR-0025,
+  ADR-0007 checklist). M5.C — the real ≥20-node party (Σ uplink ≥ 1 Gbit) serving
+  GLM-5.2 with a nightly churn cycle green — is the open exit (BENCH M5; #7).
 
 Milestone hygiene: each M ends with a measured number in `BENCH.md` (median + p99,
 exact setup, wire bytes counted at the socket, not estimated). No vibes.
