@@ -1,6 +1,6 @@
 # ADR-0019: Crate layout — single crate until it hurts
 
-- Status: proposed
+- Status: accepted
 - Date: 2026-07-21
 
 ## Context
@@ -35,6 +35,22 @@ performs the split.
 
 M2 either performs the split (recording the trigger) or explicitly re-confirms
 the single crate with reasons.
+
+## M2 re-confirmation (accepted)
+
+M2 **re-confirms the single crate** — the split trigger did not fire. Evidence
+from the batching work (ADR-0023):
+
+- Batching touched only `src/spine.rs` (batched scheduler + `generate_batch`)
+  and `src/cli.rs` (`--batch`). It added ZERO node-side surface — `src/node.rs`
+  is untouched — and ZERO new dependencies: the pipeline uses only
+  `std::thread::scope` and `std::net::TcpStream::try_clone` from std.
+- No compile-time pain and no node-binary-size pressure appeared; the
+  formats / wire / spine / node module boundaries already isolate concerns as if
+  they were crates (the node build pulls in no spine-only machinery today).
+- The anticipated `kenny-core` / `kenny-wire` / `kenny` split therefore remains
+  a *future* trigger — fired by a real dependency leak into the node build or by
+  measured compile pain — neither of which M2 produced.
 
 ## Alternatives considered
 

@@ -26,6 +26,7 @@
 //! that actually answered — a no-op when every selected expert is present.
 
 use std::collections::{BTreeMap, HashMap};
+use std::io::Write;
 use std::net::TcpStream;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -36,7 +37,7 @@ use crate::error::{Error, Result};
 use crate::manifest::{Manifest, SpineEntry};
 use crate::node::Node;
 use crate::quant;
-use crate::wire::{Dispatch, ExpertStatus, Handshake, Transport, WireCodec};
+use crate::wire::{Dispatch, ExpertStatus, Gather, Handshake, Transport, WireCodec};
 
 // -------------------------------------------------------------------------
 // Hyperparameters (Qwen3-30B-A3B defaults — the authoritative model card)
@@ -345,6 +346,27 @@ fn route(logits: &[f32], top_k: usize) -> Vec<(usize, f32)> {
 pub trait Dispatcher {
     fn dispatch(&mut self, layer: u16, x: &[f32], experts: &[u16])
     -> Result<Vec<Option<Vec<f32>>>>;
+
+    /// Dispatch `B` independent streams of the SAME MoE layer in one call: item
+    /// `i` runs `items[i].1` on activation `items[i].0`, and the result at `[i]`
+    /// is that stream's per-expert answers (`None` = not held). The default is a
+    /// sequential loop over `dispatch`, so in-process dispatchers stay correct
+    /// with no extra code; `NodeDispatch` overrides it to pipeline the `B`
+    /// round-trips over one connection (ADR-0023) — the composed-wire batching
+    /// path. Output is loop-invariant: the batched result at `[i]` equals what
+    /// `dispatch(items[i])` alone would return.
+    fn dispatch_batch(
+        &mut self,
+        layer: u16,
+        items: &[(&[f32], &[u16])],
+    ) -> Result<Vec<Vec<Option<Vec<f32>>>>> {
+        let mut out = Vec::with_capacity(items.len());
+        for &(x, experts) in items {
+            out.push(self.dispatch(layer, x, experts)?);
+        }
+        Ok(out)
+    }
+
     /// Wire bytes (up, down) measured at the socket; `(0, 0)` for in-process.
     fn wire_bytes(&self) -> (u64, u64) {
         (0, 0)
@@ -425,21 +447,18 @@ impl NodeDispatch {
     }
 }
 
-impl Dispatcher for NodeDispatch {
-    fn dispatch(
-        &mut self,
-        layer: u16,
-        x: &[f32],
+impl NodeDispatch {
+    /// Decode one gather against the experts it was requested for: verify the
+    /// node answered exactly the requested experts in dispatch order, then decode
+    /// each answered `y` (a not-held record decodes to `None`, feeding the
+    /// ADR-0008 renorm). Shared by `dispatch` and the batched `dispatch_batch`;
+    /// takes `codec` by ref (not `&self`) so the batch path can hold `&mut
+    /// self.transport` and `&self.codec` as disjoint field borrows.
+    fn decode_gather(
+        codec: &dyn WireCodec,
         experts: &[u16],
+        gather: &Gather,
     ) -> Result<Vec<Option<Vec<f32>>>> {
-        let mut xb = Vec::with_capacity(self.elem_len);
-        self.codec.encode(x, &mut xb);
-        self.transport.send_dispatch(&Dispatch {
-            layer,
-            x: xb,
-            experts: experts.to_vec(),
-        })?;
-        let gather = self.transport.recv_gather(self.elem_len)?;
         if gather.results.len() != experts.len() {
             return Err(Error::parse(format!(
                 "spine: node answered {} results for {} requested experts",
@@ -455,11 +474,116 @@ impl Dispatcher for NodeDispatch {
                 ));
             }
             out.push(match r.status {
-                ExpertStatus::Ok => Some(self.codec.decode(&r.y)?),
+                ExpertStatus::Ok => Some(codec.decode(&r.y)?),
                 ExpertStatus::NotHeld => None,
             });
         }
         Ok(out)
+    }
+}
+
+impl Dispatcher for NodeDispatch {
+    fn dispatch(
+        &mut self,
+        layer: u16,
+        x: &[f32],
+        experts: &[u16],
+    ) -> Result<Vec<Option<Vec<f32>>>> {
+        let mut xb = Vec::with_capacity(self.elem_len);
+        self.codec.encode(x, &mut xb);
+        self.transport.send_dispatch(&Dispatch {
+            layer,
+            x: xb,
+            experts: experts.to_vec(),
+        })?;
+        let gather = self.transport.recv_gather(self.elem_len)?;
+        Self::decode_gather(self.codec.as_ref(), experts, &gather)
+    }
+
+    /// Pipeline the `B` round-trips over the one connection (ADR-0023): the wire
+    /// is UNCHANGED — this sends `B` ordinary `Dispatch` frames and reads `B`
+    /// ordinary `Gather` frames, one per stream, FIFO on the single TCP stream.
+    /// A writer thread drives the sends on a `try_clone`d handle while this
+    /// thread drains the gathers on the original, joined by `std::thread::scope`
+    /// (ADR-0016 std-threads posture). Draining concurrently with sending is what
+    /// makes it deadlock-free at large `B`: a single-threaded send-all-then-recv
+    /// -all would stall once the socket buffers fill. `B <= 1` takes the plain
+    /// single round-trip — no thread or clone overhead — so `generate`'s
+    /// single-stream path (and its wire goldens) is byte-for-byte unchanged.
+    fn dispatch_batch(
+        &mut self,
+        layer: u16,
+        items: &[(&[f32], &[u16])],
+    ) -> Result<Vec<Vec<Option<Vec<f32>>>>> {
+        if items.len() <= 1 {
+            return items
+                .iter()
+                .map(|&(x, experts)| self.dispatch(layer, x, experts))
+                .collect();
+        }
+
+        // Encode every dispatch frame up front so the writer thread owns only
+        // plain bytes (no borrow of the codec, which is not `Send`).
+        let mut frames: Vec<Vec<u8>> = Vec::with_capacity(items.len());
+        let mut up_bytes = 0u64;
+        for &(x, experts) in items {
+            let mut xb = Vec::with_capacity(self.elem_len);
+            self.codec.encode(x, &mut xb);
+            let frame = Dispatch {
+                layer,
+                x: xb,
+                experts: experts.to_vec(),
+            }
+            .encode()?;
+            up_bytes += frame.len() as u64;
+            frames.push(frame);
+        }
+
+        // A second handle on the same socket for the writer thread; the reader
+        // keeps using `self.transport` (which owns the down-byte counter).
+        let write_stream = self.transport.get_ref().try_clone().map_err(|e| {
+            Error::parse(format!(
+                "spine: cannot clone node connection for batch: {e}"
+            ))
+        })?;
+
+        // Disjoint field borrows of `self` for the reader side of the scope:
+        // `&mut transport` (owns the down counter) and `&codec` (immutable).
+        let transport = &mut self.transport;
+        let codec = self.codec.as_ref();
+        let elem_len = self.elem_len;
+
+        let results = std::thread::scope(|scope| -> Result<Vec<Vec<Option<Vec<f32>>>>> {
+            let writer = scope.spawn(move || -> Result<()> {
+                let mut ws = write_stream;
+                for frame in &frames {
+                    ws.write_all(frame).map_err(|e| {
+                        Error::parse(format!("spine: batch dispatch write failed: {e}"))
+                    })?;
+                }
+                ws.flush().map_err(|e| {
+                    Error::parse(format!("spine: batch dispatch flush failed: {e}"))
+                })?;
+                Ok(())
+            });
+
+            // Drain the `B` gathers in dispatch order as they arrive.
+            let mut out = Vec::with_capacity(items.len());
+            for &(_x, experts) in items {
+                let gather = transport.recv_gather(elem_len)?;
+                out.push(Self::decode_gather(codec, experts, &gather)?);
+            }
+
+            // Surface a writer error (an EOF mid-batch would already have
+            // failed a `recv_gather` above; this catches a write/flush fault).
+            writer
+                .join()
+                .map_err(|_| Error::parse("spine: batch dispatch writer thread panicked"))??;
+            Ok(out)
+        })?;
+
+        self.transport.up += up_bytes;
+        Ok(results)
     }
 
     fn wire_bytes(&self) -> (u64, u64) {
@@ -479,23 +603,32 @@ struct LayerKv {
 }
 
 /// Measured generation stats (BENCH convention: numbers, not vibes). Byte counts
-/// come straight off the dispatcher's socket counters.
+/// come straight off the dispatcher's socket counters. For a batch of `B`
+/// streams the counters are AGGREGATE across the batch (see per-field notes);
+/// `B = 1` reduces every field to the single-stream meaning.
 #[derive(Debug, Default, Clone)]
 pub struct GenStats {
+    /// Prompt length PER STREAM (rectangular batch — all streams share it).
     pub prompt_tokens: usize,
+    /// Total tokens generated across the batch = `B × max_new`. `generated_tokens
+    /// / elapsed` is therefore the AGGREGATE tok/s the pool is measured on.
     pub generated_tokens: usize,
-    /// Dispatch frames sent (one per MoE layer per forward pass).
+    /// Dispatch frames sent = `B` per MoE layer per batched step (one composed
+    /// KNYD frame per stream, ADR-0023), summed over the whole run.
     pub dispatches: u64,
     pub experts_requested: u64,
     pub experts_answered: u64,
-    /// MoE steps where at least one selected expert did not answer (renorm ran).
+    /// MoE steps where at least one selected expert did not answer (renorm ran),
+    /// counted PER STREAM (a batched step can renorm some streams and not others).
     pub renorm_steps: u64,
     pub wire_up: u64,
     pub wire_down: u64,
     pub elapsed: Duration,
-    /// Wall time of each forward pass, in call order (prompt-priming forwards
-    /// then generation forwards). The per-token latency distribution BENCH
-    /// reports median + p99 over (`no vibes`); empty for a `logits()` prefill.
+    /// Wall time of each BATCHED step, in call order (prompt-priming steps then
+    /// generation steps). Each entry now covers all `B` streams advancing one
+    /// token together, so BENCH's median + p99 is per-STEP latency, not
+    /// per-stream; empty for a `logits()` prefill. `B = 1` is the old per-token
+    /// meaning unchanged.
     pub per_forward: Vec<Duration>,
 }
 
@@ -563,49 +696,90 @@ impl Spine {
 
     /// Greedy generation of `max_new` tokens after `prompt`, dispatching every
     /// MoE FFN through `dispatcher`. Returns the full token sequence
-    /// (prompt ++ generated) and the measured stats.
+    /// (prompt ++ generated) and the measured stats. This is the `B = 1`
+    /// specialization of [`Spine::generate_batch`] — the M1 single-stream path,
+    /// preserved byte-for-byte (its wire goldens and `GOLDEN_SPINE_TOKENS` lock
+    /// depend on this reducing exactly to the old behavior).
     pub fn generate(
         &self,
         dispatcher: &mut dyn Dispatcher,
         prompt: &[u32],
         max_new: usize,
     ) -> Result<(Vec<u32>, GenStats)> {
-        if prompt.is_empty() {
+        let (mut seqs, stats) = self.generate_batch(dispatcher, &[prompt], max_new)?;
+        // Exactly one stream in, exactly one sequence out.
+        Ok((seqs.pop().expect("one prompt -> one sequence"), stats))
+    }
+
+    /// Greedy batched generation: advance `B = prompts.len()` INDEPENDENT streams
+    /// in lockstep, one batched step per token, issuing one `dispatch_batch` per
+    /// MoE layer per step (ADR-0006 / ADR-0023 — the systolic pump amortizes the
+    /// per-layer round-trip barrier across the batch). Returns each stream's full
+    /// token sequence (its prompt ++ its generated tokens) and the AGGREGATE
+    /// stats. Rectangular batches only: every prompt must share length and every
+    /// stream generates `max_new` tokens (ragged / continuous batching is M5
+    /// elasticity, out of scope). Batching is output-invariant — each stream
+    /// reproduces what it would generate alone (`tests/dispatch.rs`,
+    /// `batch_equals_serial`).
+    pub fn generate_batch(
+        &self,
+        dispatcher: &mut dyn Dispatcher,
+        prompts: &[&[u32]],
+        max_new: usize,
+    ) -> Result<(Vec<Vec<u32>>, GenStats)> {
+        if prompts.is_empty() {
+            return Err(Error::usage("spine: a batch needs at least one prompt"));
+        }
+        let plen = prompts[0].len();
+        if plen == 0 {
             return Err(Error::usage("spine: prompt must have at least one token"));
+        }
+        if prompts.iter().any(|p| p.len() != plen) {
+            return Err(Error::usage(
+                "spine: batched prompts must share length (rectangular batch; ragged is M5)",
+            ));
         }
         if max_new == 0 {
             return Err(Error::usage("spine: --tokens must be at least 1"));
         }
+        let b = prompts.len();
         let mut stats = GenStats::default();
         let started = Instant::now();
-        let mut kv: Vec<LayerKv> = (0..self.layers.len()).map(|_| LayerKv::default()).collect();
-        let mut tokens = prompt.to_vec();
+        // Per-stream KV caches, indexed [stream][layer].
+        let mut kvs: Vec<Vec<LayerKv>> = (0..b)
+            .map(|_| (0..self.layers.len()).map(|_| LayerKv::default()).collect())
+            .collect();
+        let mut tokens: Vec<Vec<u32>> = prompts.iter().map(|p| p.to_vec()).collect();
         let mut pos = 0usize;
 
-        // Prime the KV cache with the prompt; the last prompt logits predict the
-        // first generated token.
-        let mut logits = Vec::new();
-        for &tok in prompt {
+        // Prime the KV caches with the prompt (lockstep across streams); the last
+        // prompt logits predict each stream's first generated token.
+        let mut logits: Vec<Vec<f32>> = Vec::new();
+        for i in 0..plen {
+            let toks: Vec<u32> = prompts.iter().map(|p| p[i]).collect();
             let t = Instant::now();
-            logits = self.forward_token(tok, pos, &mut kv, dispatcher, &mut stats)?;
+            logits = self.forward_batch_step(&toks, pos, &mut kvs, dispatcher, &mut stats)?;
             stats.per_forward.push(t.elapsed());
             pos += 1;
         }
-        // Emit max_new tokens; forward only to predict the NEXT one, so no extra
-        // dispatch (and no extra wire bytes) is spent past the last token (A5).
+        // Emit max_new tokens per stream; forward only to predict the NEXT one,
+        // so no extra dispatch (and no extra wire bytes) is spent past the last
+        // token (A5), exactly as the single-stream path.
         for i in 0..max_new {
-            let next = argmax(&logits);
-            tokens.push(next);
+            let next: Vec<u32> = logits.iter().map(|l| argmax(l)).collect();
+            for (s, &tok) in next.iter().enumerate() {
+                tokens[s].push(tok);
+            }
             if i + 1 < max_new {
                 let t = Instant::now();
-                logits = self.forward_token(next, pos, &mut kv, dispatcher, &mut stats)?;
+                logits = self.forward_batch_step(&next, pos, &mut kvs, dispatcher, &mut stats)?;
                 stats.per_forward.push(t.elapsed());
                 pos += 1;
             }
         }
 
-        stats.prompt_tokens = prompt.len();
-        stats.generated_tokens = max_new;
+        stats.prompt_tokens = plen;
+        stats.generated_tokens = b * max_new;
         stats.elapsed = started.elapsed();
         let (up, down) = dispatcher.wire_bytes();
         stats.wire_up = up;
@@ -663,6 +837,76 @@ impl Spine {
         }
         rms_norm_inplace(&mut h, &self.weights.norm, eps);
         Ok(matvec(&self.weights.lm_head, &h, self.vocab, self.hidden))
+    }
+
+    /// One BATCHED forward step: advance `B = toks.len()` streams one token each,
+    /// returning `B` vocab-logit vectors. Attention is per-stream (each stream
+    /// owns its `kvs[s]`); the two forwards differ only at the MoE FFN, where all
+    /// `B` streams route independently and are dispatched together in ONE
+    /// `dispatch_batch` per MoE layer (ADR-0023). Each stream then mixes and
+    /// renorms its own answers — independently, no cross-stream contamination.
+    /// `B = 1` walks the identical arithmetic as `forward_token`.
+    fn forward_batch_step(
+        &self,
+        toks: &[u32],
+        pos: usize,
+        kvs: &mut [Vec<LayerKv>],
+        dispatcher: &mut dyn Dispatcher,
+        stats: &mut GenStats,
+    ) -> Result<Vec<Vec<f32>>> {
+        let b = toks.len();
+        let eps = self.config.rms_eps;
+        // Per-stream hidden state.
+        let mut hs: Vec<Vec<f32>> = toks
+            .iter()
+            .map(|&tok| self.embed_row(tok))
+            .collect::<Result<_>>()?;
+
+        for (li, &layer) in self.layers.iter().enumerate() {
+            let lw = &self.weights.layers[&layer];
+
+            // Attention block (per stream, independent), with a residual.
+            for (s, h) in hs.iter_mut().enumerate() {
+                let normed = rms_norm(h, &lw.input_ln, eps);
+                let attn = self.attention(lw, &normed, pos, &mut kvs[s][li]);
+                for (hv, av) in h.iter_mut().zip(&attn) {
+                    *hv += av;
+                }
+            }
+
+            // MoE block: route every stream, then dispatch the whole batch in one
+            // call, then mix each stream's answers back with a residual.
+            let normed: Vec<Vec<f32>> = hs.iter().map(|h| rms_norm(h, &lw.post_ln, eps)).collect();
+            let mut routed: Vec<Vec<(usize, f32)>> = Vec::with_capacity(b);
+            let mut experts: Vec<Vec<u16>> = Vec::with_capacity(b);
+            for n in &normed {
+                let (r, e) = self.route_layer(lw, n);
+                routed.push(r);
+                experts.push(e);
+            }
+            let items: Vec<(&[f32], &[u16])> = normed
+                .iter()
+                .zip(&experts)
+                .map(|(n, e)| (n.as_slice(), e.as_slice()))
+                .collect();
+            let ys = dispatcher.dispatch_batch(layer, &items)?;
+            // One composed dispatch frame per stream crossed the wire (ADR-0023).
+            stats.dispatches += b as u64;
+            for (s, h) in hs.iter_mut().enumerate() {
+                let moe = self.mix_moe(&routed[s], &ys[s], stats);
+                for (hv, mv) in h.iter_mut().zip(&moe) {
+                    *hv += mv;
+                }
+            }
+        }
+
+        // Final norm + lm_head per stream.
+        let mut out = Vec::with_capacity(b);
+        for mut h in hs {
+            rms_norm_inplace(&mut h, &self.weights.norm, eps);
+            out.push(matvec(&self.weights.lm_head, &h, self.vocab, self.hidden));
+        }
+        Ok(out)
     }
 
     fn embed_row(&self, tok: u32) -> Result<Vec<f32>> {
@@ -741,20 +985,43 @@ impl Spine {
         dispatcher: &mut dyn Dispatcher,
         stats: &mut GenStats,
     ) -> Result<Vec<f32>> {
+        let (routed, experts) = self.route_layer(lw, x);
+        let ys = dispatcher.dispatch(layer, x, &experts)?;
+        stats.dispatches += 1;
+        Ok(self.mix_moe(&routed, &ys, stats))
+    }
+
+    /// Route one activation through a layer's gate (Qwen3 order, A1) and return
+    /// both the `(expert, weight)` pairs and the bare expert-id list to dispatch.
+    fn route_layer(&self, lw: &LayerWeights, x: &[f32]) -> (Vec<(usize, f32)>, Vec<u16>) {
         let logits = matvec(&lw.gate, x, self.experts_per_layer, self.hidden);
         let routed = route(&logits, self.config.top_k);
         let experts: Vec<u16> = routed.iter().map(|&(e, _)| e as u16).collect();
+        (routed, experts)
+    }
 
-        let ys = dispatcher.dispatch(layer, x, &experts)?;
-        stats.dispatches += 1;
-        stats.experts_requested += experts.len() as u64;
+    /// Mix one stream's dispatched `y`s weighted by the router, renormalizing
+    /// over the subset that answered (ADR-0008; a no-op when all are present).
+    /// This is the per-stream tail of the MoE step, shared by the single-stream
+    /// `moe` and the batched `forward_batch_step` so both renorm identically and
+    /// independently (no cross-stream contamination). Updates the per-stream
+    /// stats counters (`experts_requested`/`experts_answered`/`renorm_steps`);
+    /// the dispatch-FRAME count is the caller's, since one frame covers one
+    /// stream on the wire but a batch issues one frame per stream.
+    fn mix_moe(
+        &self,
+        routed: &[(usize, f32)],
+        ys: &[Option<Vec<f32>>],
+        stats: &mut GenStats,
+    ) -> Vec<f32> {
+        stats.experts_requested += routed.len() as u64;
 
         // ADR-0008 renorm denominator: the router weight mass that actually
         // answered. When every selected expert answered this equals 1 (the
         // norm_topk_prob sum), so the division below is a no-op.
         let answered_mass: f32 = routed
             .iter()
-            .zip(&ys)
+            .zip(ys)
             .filter(|(_, y)| y.is_some())
             .map(|(&(_, w), _)| w)
             .sum();
@@ -762,7 +1029,7 @@ impl Spine {
         let mut out = vec![0f32; self.hidden];
         let mut answered = 0u64;
         if answered_mass > 0.0 {
-            for (&(_, w), y) in routed.iter().zip(&ys) {
+            for (&(_, w), y) in routed.iter().zip(ys) {
                 if let Some(yv) = y {
                     answered += 1;
                     let rw = w / answered_mass;
@@ -773,10 +1040,10 @@ impl Spine {
             }
         }
         stats.experts_answered += answered;
-        if answered < experts.len() as u64 {
+        if answered < routed.len() as u64 {
             stats.renorm_steps += 1;
         }
-        Ok(out)
+        out
     }
 }
 
@@ -1129,6 +1396,185 @@ mod tests {
             "the renorm changes the output vs all-present"
         );
         assert_eq!(full_stats.renorm_steps, 0);
+    }
+
+    // --- batched scheduling (M2) -----------------------------------------
+
+    /// Records the size of each `dispatch_batch` call so a test can assert the
+    /// batched scheduler advances all streams in lockstep (one call per MoE
+    /// layer per step, carrying B items). Answers every expert deterministically.
+    struct BatchSpyDispatch {
+        hidden: usize,
+        batch_sizes: Vec<usize>,
+    }
+
+    impl Dispatcher for BatchSpyDispatch {
+        fn dispatch(
+            &mut self,
+            _layer: u16,
+            _x: &[f32],
+            experts: &[u16],
+        ) -> Result<Vec<Option<Vec<f32>>>> {
+            Ok(experts
+                .iter()
+                .map(|&e| Some(vec![e as f32 + 1.0; self.hidden]))
+                .collect())
+        }
+
+        fn dispatch_batch(
+            &mut self,
+            layer: u16,
+            items: &[(&[f32], &[u16])],
+        ) -> Result<Vec<Vec<Option<Vec<f32>>>>> {
+            self.batch_sizes.push(items.len());
+            items
+                .iter()
+                .map(|&(x, experts)| self.dispatch(layer, x, experts))
+                .collect()
+        }
+    }
+
+    /// Per-stream missing sets applied inside one batched call: stream `s` drops
+    /// the experts in `missing[s]`. Exercises independent renorm across a batch.
+    struct PerStreamMissDispatch {
+        hidden: usize,
+        missing: Vec<Vec<u16>>,
+    }
+
+    impl Dispatcher for PerStreamMissDispatch {
+        fn dispatch(
+            &mut self,
+            _layer: u16,
+            _x: &[f32],
+            experts: &[u16],
+        ) -> Result<Vec<Option<Vec<f32>>>> {
+            // A single dispatch is stream 0's view (used only if B == 1).
+            Ok(experts
+                .iter()
+                .map(|&e| {
+                    if self.missing[0].contains(&e) {
+                        None
+                    } else {
+                        Some(vec![e as f32 + 1.0; self.hidden])
+                    }
+                })
+                .collect())
+        }
+
+        fn dispatch_batch(
+            &mut self,
+            _layer: u16,
+            items: &[(&[f32], &[u16])],
+        ) -> Result<Vec<Vec<Option<Vec<f32>>>>> {
+            Ok(items
+                .iter()
+                .enumerate()
+                .map(|(s, &(_x, experts))| {
+                    experts
+                        .iter()
+                        .map(|&e| {
+                            if self.missing[s].contains(&e) {
+                                None
+                            } else {
+                                Some(vec![e as f32 + 1.0; self.hidden])
+                            }
+                        })
+                        .collect()
+                })
+                .collect())
+        }
+    }
+
+    #[test]
+    fn batched_scheduler_advances_streams_in_lockstep() {
+        // One MoE layer, vocab 1 (argmax always emits token 0). Three streams,
+        // prompt length 2, max_new 2 -> forwards = 2 (prime) + 1 (gen) = 3, one
+        // MoE layer each -> exactly 3 batched dispatch calls, each of width 3.
+        let hidden = 2;
+        let spine = one_layer_router_spine(hidden, 3, vec![1.0, 0.0, 0.0, 0.0, -1.0, 0.0]);
+        let mut spy = BatchSpyDispatch {
+            hidden,
+            batch_sizes: Vec::new(),
+        };
+        let prompts: Vec<&[u32]> = vec![&[0, 0], &[0, 0], &[0, 0]];
+        let (seqs, stats) = spine.generate_batch(&mut spy, &prompts, 2).unwrap();
+
+        assert_eq!(
+            spy.batch_sizes,
+            vec![3, 3, 3],
+            "one width-3 call per forward"
+        );
+        assert_eq!(stats.dispatches, 9, "3 streams x 3 forwards x 1 MoE layer");
+        assert_eq!(seqs.len(), 3, "one sequence per stream");
+        assert!(seqs.iter().all(|s| s.len() == 2 + 2), "prompt ++ generated");
+        assert_eq!(stats.prompt_tokens, 2, "per-stream prompt length");
+        assert_eq!(stats.generated_tokens, 3 * 2, "aggregate B x max_new");
+    }
+
+    #[test]
+    fn batched_dispatch_renorms_each_stream_independently() {
+        // Two streams share the same activation + routing, but stream 0 loses
+        // expert 1 while stream 1 keeps all three. Each must renorm over its own
+        // answered subset — no cross-stream contamination — so each stream's
+        // mixed output equals its single-stream value.
+        let hidden = 2;
+        let gate = vec![1.0, 0.0, 0.0, 0.0, -1.0, 0.0]; // [3, 2] row-major
+        let spine = one_layer_router_spine(hidden, 3, gate);
+        let lw = &spine.weights.layers[&0];
+        let x = [1.0f32, 0.0];
+        let (routed, experts) = spine.route_layer(lw, &x);
+
+        let mut mock = PerStreamMissDispatch {
+            hidden,
+            missing: vec![vec![1], vec![]],
+        };
+        let items: Vec<(&[f32], &[u16])> = vec![
+            (x.as_slice(), experts.as_slice()),
+            (x.as_slice(), experts.as_slice()),
+        ];
+        let ys = mock.dispatch_batch(0, &items).unwrap();
+
+        let mut s0 = GenStats::default();
+        let out0 = spine.mix_moe(&routed, &ys[0], &mut s0);
+        let mut s1 = GenStats::default();
+        let out1 = spine.mix_moe(&routed, &ys[1], &mut s1);
+
+        // Single-stream references through the unbatched `moe`.
+        let mut ref0 = MockDispatch {
+            hidden,
+            missing: vec![1],
+        };
+        let mut rs0 = GenStats::default();
+        let expect0 = spine.moe(0, lw, &x, &mut ref0, &mut rs0).unwrap();
+        let mut ref1 = MockDispatch {
+            hidden,
+            missing: vec![],
+        };
+        let mut rs1 = GenStats::default();
+        let expect1 = spine.moe(0, lw, &x, &mut ref1, &mut rs1).unwrap();
+
+        assert_eq!(out0, expect0, "renorm-losing stream matches its solo value");
+        assert_eq!(out1, expect1, "all-present stream matches its solo value");
+        assert_ne!(
+            out0, out1,
+            "streams renorm independently (no contamination)"
+        );
+        assert_eq!((s0.renorm_steps, s1.renorm_steps), (1, 0));
+    }
+
+    #[test]
+    fn generate_batch_rejects_ragged_prompts() {
+        let hidden = 2;
+        let spine = one_layer_router_spine(hidden, 3, vec![1.0, 0.0, 0.0, 0.0, -1.0, 0.0]);
+        let mut mock = MockDispatch {
+            hidden,
+            missing: vec![],
+        };
+        let prompts: Vec<&[u32]> = vec![&[0, 0], &[0]];
+        assert!(
+            spine.generate_batch(&mut mock, &prompts, 1).is_err(),
+            "ragged batches are rejected (rectangular only; ragged is M5)"
+        );
     }
 
     // --- end-to-end LocalDispatch smoke (node<->local equivalence lives in
