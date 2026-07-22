@@ -13,6 +13,7 @@ use crate::fixture;
 use crate::manifest::{self, Manifest};
 use crate::node::{self, Hold};
 use crate::placement::{HeatMap, NodeDesc, build_placement};
+use crate::prefix;
 use crate::rng::SplitMix64;
 use crate::spine::{self, Config, LocalDispatch, NodeDispatch, PlacedDispatch, Spine};
 use crate::wire::{Bf16Codec, Fp8Codec, WireCodec};
@@ -103,6 +104,21 @@ USAGE:
         attention) loads only at --num-heads 1 --num-kv-heads 1 --head-dim <hidden>.
         CI never downloads a model — run this against a real --model for a BENCH
         Δppl (KENNY_MODEL_DIR in the gated test arm).
+
+    kenny prefix --carved <dir>
+                 [--streams N] [--system-len N] [--user-len N] [--block N]
+                 [--seed N] [--vocab N] [--num-kv-heads N] [--head-dim N]
+        The ADR-0022 prefix-cache hit-rate on a SHARED-SYSTEM-PROMPT fixture: N
+        streams share a --system-len system prompt and each carry a distinct
+        seed-derived --user-len user tail; prompt tokens are chunked into --block
+        blocks whose blake3 hash-chain keys (rooted in the manifest identity) are
+        looked up in a spine-local radix, and prefix_hit_rate = reused / total
+        prompt tokens is reported. Model-free: it reads only the carve's manifest
+        (identity + MoE layer count), loads NO weights. The derived KV occupancy
+        (B x ctx x layers x kv_elem, from the existing LayerKv) is printed
+        alongside — --num-kv-heads / --head-dim default to the Qwen3-30B-A3B card
+        (the fixture is --num-kv-heads 1 --head-dim <hidden>). Spine-local cache,
+        NO consensus surface (WIRE_VERSION unchanged).
 ";
 
 pub fn run(args: &[String]) -> Result<()> {
@@ -117,6 +133,7 @@ pub fn run(args: &[String]) -> Result<()> {
         Some("node") => run_node(&args[1..]),
         Some("spine") => run_spine(&args[1..]),
         Some("canary") => run_canary(&args[1..]),
+        Some("prefix") => run_prefix(&args[1..]),
         Some(other) => Err(Error::usage(format!("unknown command {other:?}"))),
     }
 }
@@ -821,6 +838,82 @@ fn run_canary(args: &[String]) -> Result<()> {
     println!(
         "delta:    Δppl {:+.6} (test − ref) — ADR-0008 canary / ADR-0018 quality axis",
         r.delta_ppl
+    );
+    Ok(())
+}
+
+fn run_prefix(args: &[String]) -> Result<()> {
+    let mut carved: Option<PathBuf> = None;
+    let mut opts = prefix::PrefixOptions::default();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--carved" => carved = Some(PathBuf::from(value(args, &mut i, "--carved")?)),
+            "--streams" => {
+                opts.streams =
+                    parse_num(value(args, &mut i, "--streams")?, "--streams", 1, 1 << 24)? as usize;
+            }
+            "--system-len" => {
+                opts.system_len = parse_num(
+                    value(args, &mut i, "--system-len")?,
+                    "--system-len",
+                    0,
+                    1 << 24,
+                )? as usize;
+            }
+            "--user-len" => {
+                opts.user_len =
+                    parse_num(value(args, &mut i, "--user-len")?, "--user-len", 0, 1 << 24)?
+                        as usize;
+            }
+            "--block" => {
+                opts.block_tokens =
+                    parse_num(value(args, &mut i, "--block")?, "--block", 1, 1 << 24)? as usize;
+            }
+            "--seed" => {
+                opts.seed = parse_num(value(args, &mut i, "--seed")?, "--seed", 0, u64::MAX)?
+            }
+            "--vocab" => {
+                opts.vocab = parse_num(value(args, &mut i, "--vocab")?, "--vocab", 1, u64::MAX)?;
+            }
+            "--num-kv-heads" => {
+                opts.num_kv_heads = parse_num(
+                    value(args, &mut i, "--num-kv-heads")?,
+                    "--num-kv-heads",
+                    1,
+                    1 << 16,
+                )? as usize;
+            }
+            "--head-dim" => {
+                opts.head_dim =
+                    parse_num(value(args, &mut i, "--head-dim")?, "--head-dim", 1, 1 << 16)?
+                        as usize;
+            }
+            other => {
+                return Err(Error::usage(format!(
+                    "prefix: unexpected argument {other:?}"
+                )));
+            }
+        }
+        i += 1;
+    }
+    let carved = carved.ok_or_else(|| Error::usage("prefix: --carved is required"))?;
+
+    let r = prefix::run(&carved, &opts)?;
+    println!(
+        "prefix:   {} streams, system {} + user {} tokens, block {} (seed {})",
+        r.streams, r.system_len, r.user_len, r.block_tokens, opts.seed
+    );
+    println!(
+        "hit-rate: {:.4} ({} reused / {} total prompt tokens), {} distinct blocks",
+        r.hit_rate, r.reused_prompt_tokens, r.total_prompt_tokens, r.distinct_blocks
+    );
+    println!(
+        "kv:       {} B occupancy (derived: {} streams x {} ctx x {} layers x kv_elem)",
+        r.kv_occupancy_bytes,
+        r.streams,
+        r.system_len + r.user_len,
+        r.kv_layers
     );
     Ok(())
 }

@@ -540,17 +540,76 @@ int8 arm (the `Int8Codec` is the deferred follow-up), so ADR-0018 stays `propose
 > concern (#6). CI runs the canary model-free on the fixture (deterministic to the bit);
 > this real number is the `KENNY_MODEL_DIR`-gated arm.
 
+### Prefix-cache hit-rate — shared-system-prompt fixture (ADR-0022 identity primitive)
+
+Dashboard number **#5**, the ADR-0022 survival metric (MANIFESTO §4.5: prefill is
+existential). Prompt tokens are chunked into blocks whose blake3 hash-chain keys
+are rooted in the manifest identity (ADR-0005) and looked up in a spine-LOCAL
+radix; `prefix_hit_rate = reused / total` prompt tokens, where a hit is a block
+whose KV can be served from cache without an expert dispatch. The number is only
+meaningful against SHARED prompts (independent prompts have zero reuse — the
+mitigation for the "meaningless hit-rate on random streams" risk), so the fixture
+has every stream share a system prompt and carry a distinct seed-derived user
+tail — the agent-colony regime ADR-0022 targets. The cache is spine-local and
+holds block KEYS only (no KV payload, no wire, no manifest — `WIRE_VERSION` 1,
+the five wire goldens byte-identical); the block-key encoding has its own golden.
+**Model-free and deterministic** (reads only the carve's manifest for the
+identity + MoE layer count, loads no weights), so it runs in plain CI; the
+hit-rate depends only on the shared-prompt structure, not on the model.
+
+| streams | system | user | block | reused / total tokens | hit-rate |
+|---|---|---|---|---|---|
+| 8 | 256 | 64 | 64 | 1,792 / 2,560 | 0.7000 |
+| 16 | 256 | 64 | 64 | 3,840 / 5,120 | 0.7500 |
+| 64 | 256 | 64 | 64 | 16,128 / 20,480 | 0.7875 |
+| 8 | 512 | 64 | 64 | 3,584 / 4,608 | 0.7778 |
+| **512** | **4,096** | **512** | **256** | **2,093,056 / 2,359,296** | **0.8872** |
+
+The rate climbs toward the ADR-0022 **80–90 %+** regime exactly as the shared
+system prompt lengthens and more streams amortize the cold first stream that
+primes the cache (only stream 0 ever misses the shared prefix): a 512-stream
+colony behind a 4,096-token shared system prompt reaches **0.8872** — the 80-90 %
+reuse the wire math survives on, every hit being prefill bytes that never touch
+the star. Exact-match semantics are locked by test: a one-token divergence
+invalidates every subsequent block (the chain propagates the miss).
+
+**Derived KV occupancy** (dashboard number **#2**), reported alongside — NOT a new
+subsystem (the KV memory hierarchy is deferred, ADR-0022): straight from the
+existing `LayerKv`, `occupancy = batch × ctx × layers × kv_elem` with
+`kv_elem = 2 × num_kv_heads × head_dim × 4` bytes/token/layer (one `k` + one `v`
+row of f32). At the 512-stream row, ctx = 4,608 (4,096 system + 512 user) across
+48 MoE layers at the Qwen3-30B-A3B card's KV geometry (4 KV heads × 128 head_dim,
+`kv_elem` = 4,096 B):
+
+```
+512 streams × 4,608 ctx × 48 layers × 4,096 B = 463,856,467,968 B = 432.0 GiB
+```
+
+the KV-wall side of MANIFESTO §5 (0.61 MB/token × 512 × 4k ≈ 1.2 TB is the
+full-4k number; 432 GiB is this run's 4,608-ctx point) — which is precisely why
+the prefix hit-rate above is the survival metric: cache reuse is the lever
+against that wall.
+
 ### Dashboard numbers landed this milestone
+
+All five M4 dashboard numbers now land (three built, two derived from existing
+state):
 
 - **#1 batch depth** — the `B` streams advanced in lockstep (M2/M3 `GenStats`),
   here 1 and 8 across the placed pool; aggregate tok/s is the product line above.
+- **#2 KV occupancy** — the derived `B × ctx × layers × kv_elem` from the
+  existing `LayerKv`, reported alongside the hit-rate above.
 - **#3 perplexity canary** — the fp8-vs-bf16-source Δppl table above (ADR-0008
   corollary; ADR-0018 quality axis, fp8 half).
 - **#4 per-node step p99** — the tables above (the placement-relevant number).
+- **#5 prefix-cache hit-rate** — the shared-system-prompt table above (ADR-0022
+  identity primitive).
 
-The remaining M4 dashboard numbers land in the following M4 PR, not this one:
-**#5 prefix-cache hit-rate** (ADR-0022 identity primitive); **#2 KV occupancy** is a
-derived `B × ctx × layers × kv_elem` from the existing `LayerKv` reported alongside it.
+This completes the M4 arc's single-machine-buildable scope. What stays open on #6
+is only the literal real party (the "Deferred — real-party numbers" subsection
+below): real nodes/spine/internet, correlated churn, a populated WAN tail, the
+ADR-0006 critical-mass crossover, and the KV memory hierarchy + real-workload
+hit-rate that full ADR-0022 acceptance needs.
 
 ### Deferred — real-party numbers (#6 stays open)
 
@@ -601,4 +660,16 @@ KENNY_MODEL_DIR=<model_dir> cargo test --release --test dispatch \
 # Model-free deterministic arm runs in a plain `cargo test`
 # (src/canary.rs::{score_tokens_*, reference_perplexity_is_exactly_reproducible,
 #  fixture_fp8_canary_is_finite_and_deterministic}).
+
+# Prefix-cache hit-rate + derived KV occupancy (dashboards #5 and #2).
+# Model-free: needs only a carve's manifest (identity + MoE layer count).
+kenny fixture --out /tmp/m --layers 48 --experts 4
+kenny carve /tmp/m --out /tmp/c --dtype fp8
+kenny prefix --carved /tmp/c --streams 512 --system-len 4096 --user-len 512 --block 256
+# The hit-rate is model-independent (shared-prompt structure only); the sweep
+# rows use --num-kv-heads 1 --head-dim 8 (fixture square attention) for the KV
+# figure, the 512-stream row uses the Qwen3-30B-A3B card defaults (4 / 128).
+# All deterministic; the CI locks are src/prefix.rs::{golden_block_key_chain,
+# shared_system_prompt_hits_after_first_stream, one_token_divergence_*,
+# hit_rate_is_deterministic, run_measures_shared_prompt_hit_rate}.
 ```

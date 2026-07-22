@@ -1275,6 +1275,27 @@ struct LayerKv {
     v: Vec<Vec<f32>>,
 }
 
+/// Derived KV-cache occupancy in bytes for a run of `batch` streams each holding
+/// `ctx` positions across `layers` MoE layers — the ADR-0022 dashboard #2,
+/// reported ALONGSIDE the prefix hit-rate (not a new subsystem: the KV memory
+/// hierarchy stays deferred). It is derived straight from the existing
+/// [`LayerKv`]: every processed position stores one `k` and one `v` row of
+/// `num_kv_heads × head_dim` f32 each, so `kv_elem = 2 × (num_kv_heads ×
+/// head_dim) × 4` bytes per token per layer, and occupancy is
+/// `batch × ctx × layers × kv_elem`. `u64` throughout so a real B×ctx×layers
+/// product (the MANIFESTO §5 KV-wall arithmetic) does not overflow.
+pub fn kv_occupancy_bytes(
+    layers: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    batch: usize,
+    ctx: usize,
+) -> u64 {
+    // k + v, each num_kv_heads × head_dim f32 (4 bytes).
+    let kv_elem = 2u64 * (num_kv_heads as u64) * (head_dim as u64) * 4;
+    (batch as u64) * (ctx as u64) * (layers as u64) * kv_elem
+}
+
 /// Measured generation stats (BENCH convention: numbers, not vibes). Byte counts
 /// come straight off the dispatcher's socket counters. For a batch of `B`
 /// streams the counters are AGGREGATE across the batch (see per-field notes);
