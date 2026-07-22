@@ -500,7 +500,11 @@ worst-of-≈2 forwards (a coarse anchor, not a tail — the plan's budget cap).
 
 The placed path runs the real model end-to-end across three shaped nodes on the
 existing wire; the per-node times converge at B=8 (all nodes saturated on compute,
-the 20/60/100 ms shaping is a rounding error against seconds of fp8 forward). The
+the 20/60/100 ms shaping is a rounding error against seconds of fp8 forward).
+Caveat: per-node latency is read in ascending node-index order after a hoisted
+send, so a fast node read after a slower co-fanned one inherits its head-of-line
+wait — per-node values here are upper bounds, exact only when index order matches
+delay order (the fixture arm) — see #28 for the order-independent read. The
 un-tuned dense forward is the wall-clock (~9 s/forward, the M1/M3 figure);
 forward-perf tuning stays out of scope as in M1–M3.
 

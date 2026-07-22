@@ -218,8 +218,7 @@ impl Node {
     /// `not-held` for it. The serve loop and the wire are untouched — a subset
     /// node is just a node that answers `not-held` more often (ADR-0024). This is
     /// what lets N nodes hold DISTINCT expert sets on one host so the netns/netem
-    /// sim can measure per-node step p99 across heterogeneous uplinks. Returns the
-    /// number of experts retained.
+    /// sim can measure per-node step p99 across heterogeneous uplinks.
     pub fn apply_hold(&mut self, hold: &Hold) {
         let all: Vec<(u16, u16)> = self.index.keys().copied().collect();
         for (layer, expert) in all {
