@@ -52,7 +52,7 @@
 //!           then y_len bytes of encoded y iff status == ok (none for not-held)
 //! ```
 
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 
 use crate::bf16;
 use crate::error::{Error, Result};
@@ -498,11 +498,40 @@ impl<S: Read + Write> Transport<S> {
         Ok(())
     }
 
+    // A manual read loop (not `read_exact`) so a byte IS counted the moment it
+    // crosses the socket: `read_exact` throws its partial-fill count away on
+    // error, and a per-layer deadline (ADR-0010) firing mid-frame is exactly
+    // such an error — undercounting `down` there would break the "count bytes
+    // at the socket, not estimated" rule the moment a timeout fires. Each
+    // successful partial `read` is credited before the loop continues, so a
+    // WouldBlock/TimedOut (the read deadline) or any other I/O error still
+    // leaves `self.down` accounting for everything actually received; the
+    // caller (on a timeout) reconnects and discards the desynced stream
+    // itself, but the byte counters carry across unaffected by that.
     fn read_counted(&mut self, buf: &mut [u8]) -> Result<()> {
-        self.stream
-            .read_exact(buf)
-            .map_err(|e| Error::parse(format!("wire: read failed: {e}")))?;
-        self.down += buf.len() as u64;
+        let mut filled = 0;
+        while filled < buf.len() {
+            match self.stream.read(&mut buf[filled..]) {
+                Ok(0) => {
+                    return Err(Error::parse(
+                        "wire: read failed: unexpected EOF before the frame filled".to_string(),
+                    ));
+                }
+                Ok(n) => {
+                    filled += n;
+                    self.down += n as u64;
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                // A read deadline (set via `TcpStream::set_read_timeout`, off by
+                // default) surfaces as its own error so the per-layer timeout
+                // (ADR-0010) can tell a straggler from a real fault; `WouldBlock`
+                // (Unix) and `TimedOut` (Windows) both mean the deadline elapsed.
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                    return Err(Error::timeout());
+                }
+                Err(e) => return Err(Error::parse(format!("wire: read failed: {e}"))),
+            }
+        }
         Ok(())
     }
 
@@ -1015,5 +1044,41 @@ mod tests {
         let down_framing =
             GATHER_HEADER_LEN as u64 + GATHER_RECORD_HEADER_LEN as u64 * g.results.len() as u64;
         assert_eq!(t.down, down_payload + down_framing);
+    }
+
+    #[test]
+    fn read_counted_credits_partial_bytes_on_timeout() {
+        // A5 corollary, exercised by ADR-0010's per-layer timeout: a read
+        // deadline firing MID-FRAME must still credit the bytes that actually
+        // crossed the socket before it fired. `read_exact` throws its
+        // partial-fill count away on error, so `read_counted` must not
+        // delegate to it wholesale — otherwise `wire_down` silently undercounts
+        // on every fired timeout, contradicting "count bytes at the socket,
+        // not estimated" (CLAUDE.md) the moment a straggler shows up.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            // Half a handshake frame, then go silent — the client's read
+            // deadline must fire before the rest ever arrives.
+            sock.write_all(&[0u8; HANDSHAKE_LEN / 2]).unwrap();
+            sock.flush().unwrap();
+            thread::sleep(std::time::Duration::from_millis(500));
+        });
+
+        let stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_millis(50)))
+            .unwrap();
+        let mut t = Transport::new(stream);
+        let err = t.recv_handshake().unwrap_err();
+        assert!(err.is_timeout(), "expected a timeout error, got {err:?}");
+        assert_eq!(
+            t.down,
+            (HANDSHAKE_LEN / 2) as u64,
+            "the half-frame the server DID send must still be credited to `down`"
+        );
+        server.join().unwrap();
     }
 }
