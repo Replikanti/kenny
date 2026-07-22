@@ -42,11 +42,19 @@ user-facing (the gate, M4); all state stays on the spine (ADR-0004).
   token's KV block was served from any tier without expert dispatch.
   Recorded per client and aggregate, derived from the dispatch log (which
   gains prefill/decode labeling — the same records ADR-0014 meters from).
-- **M4 implements**: block hashing + radix lookup, the fp8 RAM tier, weighted
-  LRU eviction, chunked decode-first prefill admission, the hit-rate metric.
-  **Deferred**: int4 KV tier, NVMe paging, DSA-driven sparse page-in (needs
-  GLM-class attention; the Qwen3 M4 party has a small KV appetite), and
-  cross-spine prefix sharing (multi-spine future).
+- **M4 lands (rescoped single-machine slice, 2026-07-22)**: the IDENTITY
+  PRIMITIVE — block hashing (the model-identity-rooted blake3 chain) + the radix
+  lookup — and the `prefix_hit_rate` metric, measured on a shared-system-prompt
+  fixture so the number is real and non-zero (`src/prefix.rs`, `kenny prefix`).
+  **Deferred to the real party (#6)**: KV BLOCK STORAGE + tiering (the fp8 RAM
+  tier, int4 KV, NVMe paging, DSA-driven sparse page-in), weighted-LRU eviction,
+  and chunked decode-first prefill admission — every one is only measurable
+  against a real memory-bound, concurrency-bound serving loop with genuinely
+  shared prompts, which the M4 spine-sim (synthetic single-host streams) cannot
+  exercise, and cross-spine prefix sharing (a multi-spine future). **KV
+  occupancy** (dashboard #2) is reported now as a DERIVED number
+  (`batch × ctx × layers × kv_elem` from the existing `LayerKv`), not a new
+  subsystem.
 
 ## Consequences
 
@@ -76,7 +84,23 @@ user-facing (the gate, M4); all state stays on the spine (ADR-0004).
 - **No prefix cache at M4** — MANIFESTO §4.5 arithmetic says the party dies
   under its own prefill; rejected by the numbers.
 
+## Status note (M4, 2026-07-22)
+
+This ADR stays `proposed`. What landed is the spine-LOCAL identity primitive and
+the hit-rate meter only: `PrefixCache` hashes prompt blocks into the
+model-identity-rooted chain, looks them up in a radix over the chained keys
+(content addressing collapses the trie into membership), and reports
+`prefix_hit_rate = reused / total` prompt tokens. It holds block KEYS, not KV
+payload — so it touches no consensus surface (no `WIRE_VERSION`, codec, or
+manifest change; the block-key encoding is a spine-local canonical encoding with
+its own golden). On a shared-system-prompt fixture the meter reaches the 80–90 %
+regime this ADR's arithmetic survives on (BENCH "M4 — prefix-cache hit-rate").
+The KV memory hierarchy (storage, tiering, eviction, admission) is deferred to a
+real serving loop; full acceptance is the real agent workload below (#6).
+
 ## Accept when
 
 M4 lands the spine-side prefix cache and the day-zero dashboard reports a
-measured prefix-cache hit rate on a real agent workload.
+measured prefix-cache hit rate on a real agent workload (the real party, #6 —
+the identity primitive + hit-rate meter land now; the KV memory hierarchy and
+the real-workload number are the remaining acceptance gate).
