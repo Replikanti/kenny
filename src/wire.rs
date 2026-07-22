@@ -15,9 +15,12 @@
 //!
 //! The transport is interim sync TCP (ADR-0016, proposed): std threads, blocking
 //! I/O, no async runtime; it sits behind this one boundary so M3 can swap it.
-//! Every read and write is counted at the socket so wire bytes are measured, not
-//! estimated (MANIFESTO §4.3 / BENCH "no vibes"). Framing bytes are accounted
-//! exactly and separately from payload so tests can assert up/down independently.
+//! Each successfully completed read/write advances the byte counters by its full
+//! length, so wire bytes are measured, not estimated (MANIFESTO §4.3 / BENCH "no
+//! vibes"); framing bytes are accounted exactly and separately from payload so
+//! tests can assert up/down independently. A call that errors mid-transfer ends
+//! the session (the connection is torn down and the counters are not consumed),
+//! so the counters are exact for the successful path — the only path BENCH reads.
 //!
 //! ```text
 //! Handshake frame (fixed 44 bytes, no length prefix):
@@ -458,9 +461,12 @@ impl Gather {
 // -------------------------------------------------------------------------
 
 /// A blocking byte-counted transport over any `Read + Write` (a
-/// `std::net::TcpStream` in production, an in-memory duplex in tests). `up` /
-/// `down` count EVERY byte crossing the socket — handshake and framing
-/// included — so BENCH numbers are measured at the wire, not estimated.
+/// `std::net::TcpStream` in production, an in-memory duplex in tests). Each
+/// successfully completed send/recv advances `up` / `down` by its full length —
+/// handshake and framing included — so BENCH numbers are measured at the wire,
+/// not estimated. A send/recv that errors mid-transfer ends the session, so the
+/// counters are exact for completed calls (the only counts BENCH consumes); they
+/// are not a partial-progress meter for a failed, torn-down connection.
 #[derive(Debug)]
 pub struct Transport<S> {
     stream: S,
@@ -514,7 +520,13 @@ impl<S: Read + Write> Transport<S> {
         self.write_counted(&d.encode()?)
     }
 
-    pub fn recv_dispatch(&mut self) -> Result<Dispatch> {
+    /// Receive a dispatch. `expect_x_len` is the only legal activation size —
+    /// `hidden * codec.elem_bytes()` from the negotiated handshake codec and the
+    /// receiver's manifest. The header's `x_len` is checked against it BEFORE
+    /// any buffer is allocated, so a hostile or corrupt length prefix (e.g.
+    /// `x_len = 2_000_000_000`) is rejected without committing memory. The
+    /// expert-id list is `u16`-bounded by `n_experts` and needs no extra cap.
+    pub fn recv_dispatch(&mut self, expect_x_len: usize) -> Result<Dispatch> {
         let mut head = [0u8; DISPATCH_HEADER_LEN];
         self.read_counted(&mut head)?;
         if head[0..4] != MAGIC_DISPATCH {
@@ -522,6 +534,12 @@ impl<S: Read + Write> Transport<S> {
         }
         let n_experts = u16::from_le_bytes([head[6], head[7]]) as usize;
         let x_len = u32::from_le_bytes([head[8], head[9], head[10], head[11]]) as usize;
+        if x_len != expect_x_len {
+            return Err(Error::parse(format!(
+                "wire: dispatch x_len {x_len}, negotiated codec + model imply exactly \
+                 {expect_x_len} (refusing to allocate an untrusted length)"
+            )));
+        }
         let body_len = x_len
             .checked_add(2 * n_experts)
             .ok_or_else(|| Error::parse("wire: dispatch header implies an impossible size"))?;
@@ -535,7 +553,14 @@ impl<S: Read + Write> Transport<S> {
         self.write_counted(&g.encode()?)
     }
 
-    pub fn recv_gather(&mut self) -> Result<Gather> {
+    /// Receive a gather. `expect_y_len` is the only legal per-answered-y size —
+    /// `hidden * codec.elem_bytes()` from the negotiated handshake codec and the
+    /// receiver's manifest. The header's `y_len` is checked against it BEFORE
+    /// any record buffer is allocated, so a hostile `y_len = 2_000_000_000`
+    /// prefix is rejected without committing ~2 GB of zeros. `n_results` is
+    /// `u16`-bounded and each record's bytes must actually arrive on the socket,
+    /// so no single allocation can outrun the payload.
+    pub fn recv_gather(&mut self, expect_y_len: usize) -> Result<Gather> {
         let mut head = [0u8; GATHER_HEADER_LEN];
         self.read_counted(&mut head)?;
         if head[0..4] != MAGIC_GATHER {
@@ -543,6 +568,12 @@ impl<S: Read + Write> Transport<S> {
         }
         let n_results = u16::from_le_bytes([head[6], head[7]]) as usize;
         let y_len = u32::from_le_bytes([head[8], head[9], head[10], head[11]]) as usize;
+        if y_len != expect_y_len {
+            return Err(Error::parse(format!(
+                "wire: gather y_len {y_len}, negotiated codec + model imply exactly \
+                 {expect_y_len} (refusing to allocate an untrusted length)"
+            )));
+        }
         // Read records one at a time — a record's size depends on its status,
         // so we cannot know the frame length from the header alone.
         let mut frame = head.to_vec();
@@ -856,11 +887,47 @@ mod tests {
         buf.extend_from_slice(&gath.encode().unwrap());
         let mut r = Transport::new(Cursor::new(buf));
         assert_eq!(r.recv_handshake().unwrap(), hs);
-        assert_eq!(r.recv_dispatch().unwrap(), disp);
-        assert_eq!(r.recv_gather().unwrap(), gath);
+        // 3 fp8 elements = 3 bytes per activation / answered y.
+        assert_eq!(r.recv_dispatch(3).unwrap(), disp);
+        assert_eq!(r.recv_gather(3).unwrap(), gath);
         assert_eq!(
             r.down,
             hs_len + disp_len + gath.encode().unwrap().len() as u64
+        );
+    }
+
+    #[test]
+    fn recv_rejects_oversized_length_prefix() {
+        // A 12-byte KNYD header claiming a 2 GB activation: recv_dispatch must
+        // reject it against the negotiated size BEFORE allocating any buffer,
+        // so only the header (not ~2 GB of zeros) is ever touched. We assert on
+        // the length-prefix error message to prove rejection is pre-allocation,
+        // not a later truncation error.
+        let mut d_head = Vec::new();
+        d_head.extend_from_slice(&MAGIC_DISPATCH);
+        d_head.extend_from_slice(&3u16.to_le_bytes()); // layer
+        d_head.extend_from_slice(&1u16.to_le_bytes()); // n_experts
+        d_head.extend_from_slice(&2_000_000_000u32.to_le_bytes()); // hostile x_len
+        assert_eq!(d_head.len(), DISPATCH_HEADER_LEN);
+        let mut t = Transport::new(Cursor::new(d_head));
+        let err = format!("{}", t.recv_dispatch(8).unwrap_err());
+        assert!(
+            err.contains("x_len"),
+            "expected a length-prefix rejection, got: {err}"
+        );
+
+        // Same allocation-DoS class for KNYG y_len.
+        let mut g_head = Vec::new();
+        g_head.extend_from_slice(&MAGIC_GATHER);
+        g_head.extend_from_slice(&3u16.to_le_bytes()); // layer
+        g_head.extend_from_slice(&1u16.to_le_bytes()); // n_results
+        g_head.extend_from_slice(&2_000_000_000u32.to_le_bytes()); // hostile y_len
+        assert_eq!(g_head.len(), GATHER_HEADER_LEN);
+        let mut t = Transport::new(Cursor::new(g_head));
+        let err = format!("{}", t.recv_gather(8).unwrap_err());
+        assert!(
+            err.contains("y_len"),
+            "expected a length-prefix rejection, got: {err}"
         );
     }
 
@@ -888,7 +955,8 @@ mod tests {
             let (sock, _) = listener.accept().unwrap();
             let mut t = Transport::new(sock);
             let got_hs = t.recv_handshake().unwrap();
-            let got_disp = t.recv_dispatch().unwrap();
+            // 4 bf16 elements = 8 bytes per activation / answered y.
+            let got_disp = t.recv_dispatch(8).unwrap();
             let mut y = Vec::new();
             Bf16Codec.encode(&[9.0f32, 8.0, 7.0, 6.0], &mut y);
             let g = Gather {
@@ -920,7 +988,7 @@ mod tests {
         let mut t = Transport::new(TcpStream::connect(addr).unwrap());
         t.send_handshake(&hs_c).unwrap();
         t.send_dispatch(&disp_c).unwrap();
-        let g = t.recv_gather().unwrap();
+        let g = t.recv_gather(8).unwrap();
         let g_expected = server.join().unwrap();
         assert_eq!(g, g_expected);
 
