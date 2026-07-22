@@ -34,6 +34,19 @@ corrupted blobs, and creeping capacity loss.
 - Canary + heat-map infrastructure is on the critical path of early milestones,
   not a nice-to-have for later.
 
+### M4 update (2026-07-22) — perplexity canary landed
+
+The **perplexity canary** half of the corollary is now implemented (`src/canary.rs`,
+`kenny canary`): teacher-forced perplexity of a carved blob+wire path scored against
+the bf16-source reference (the M0/M1 `diff.rs::source_matrix` methodology, A6) over a
+fixed seed-keyed prompt set, reported as `Δppl = ppl(test) − ppl(ref)`. The per-position
+teacher-forced logits it needs are `Spine::logits_per_position`; the score is the stable
+`logsumexp(logits) − logits[target]` mean, exponentiated. CI runs it model-free on the
+fixture (deterministic); the real Qwen3-30B-A3B Δppl is the `KENNY_MODEL_DIR`-gated arm
+and lands in BENCH "M4 — perplexity canary". This is also the deciding quality axis
+ADR-0018 was blocked on. The **heat-map alarm** half already shipped with placement
+(`PlacedDispatch::suspect_replicas`, M4 PR2). Both dashboard corollaries are now real.
+
 ## Alternatives considered
 
 - **Block / retry until the expert answers** — hands tail latency to the slowest

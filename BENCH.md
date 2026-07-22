@@ -508,16 +508,49 @@ delay order (the fixture arm) — see #28 for the order-independent read. The
 un-tuned dense forward is the wall-clock (~9 s/forward, the M1/M3 figure);
 forward-perf tuning stays out of scope as in M1–M3.
 
+### Perplexity canary — fp8 vs bf16-source (ADR-0008 corollary / ADR-0018 quality axis)
+
+Dashboard number **#3**, and the deciding **quality axis** ADR-0018 was blocked on:
+teacher-forced perplexity of the fp8 blob+wire path scored against the bf16-source
+reference (the M0/M1 `diff.rs::source_matrix` methodology, A6), over a fixed seed-keyed
+prompt set. Both paths hold every expert, so **nothing renorms** — the delta is pure
+quantization quality, not dropout. The per-token score is the stable
+`logsumexp(logits) − logits[target]`; the mean NLL exponentiates to perplexity. Real
+Qwen3-30B-A3B (`KENNY_MODEL_DIR`), Config = the model card, **2 sequences × 16 tokens
+(30 scored transitions), seed 42**; 733.5 s wall (64 teacher-forced forwards, the
+un-tuned ~11 s/forward dense cost — forward-perf tuning stays out of scope as in M1–M3).
+
+| path | mean NLL (nats/tok) | perplexity | Δ vs bf16-source |
+|---|---|---|---|
+| bf16-source reference | 16.33824 | 12,462,520.60 | — |
+| fp8 blobs + fp8 wire | 16.63653 | 16,793,954.18 | **+0.298 nats/tok · ppl ×1.347 · Δppl +4,331,433.57** |
+
+fp8 diverges from the bf16 reference by **+0.298 nats/token** — directionally consistent
+with the M1 end-to-end fp8 wire cosine (0.99985), now as a scored quality delta. This
+**unblocks ADR-0018's deciding axis** for the fp8 half; naming a default still needs the
+int8 arm (the `Int8Codec` is the deferred follow-up), so ADR-0018 stays `proposed`.
+
+> **Random-token caveat (bench honesty):** kenny carries **no tokenizer** (it operates on
+> token ids, like `kenny spine` and the S7 harness), so the canary set is random in-vocab
+> ids, not natural language. The model assigns worse-than-uniform mass to a random next
+> token (NLL 16.3 > `ln(vocab)` = 11.9), so the **absolute** perplexity is astronomical
+> and is NOT a language-modeling perplexity — only the **fp8-vs-bf16 delta** is the signal,
+> and on anti-natural streams it is an upper-ish bound on the natural-text loss. A
+> tokenizer-backed natural-text canary needs assets kenny does not ship — a real-party
+> concern (#6). CI runs the canary model-free on the fixture (deterministic to the bit);
+> this real number is the `KENNY_MODEL_DIR`-gated arm.
+
 ### Dashboard numbers landed this milestone
 
 - **#1 batch depth** — the `B` streams advanced in lockstep (M2/M3 `GenStats`),
   here 1 and 8 across the placed pool; aggregate tok/s is the product line above.
+- **#3 perplexity canary** — the fp8-vs-bf16-source Δppl table above (ADR-0008
+  corollary; ADR-0018 quality axis, fp8 half).
 - **#4 per-node step p99** — the tables above (the placement-relevant number).
 
-The remaining M4 dashboard numbers land in the following M4 PRs, not this one:
-**#5 prefix-cache hit-rate** (ADR-0022 identity primitive) and the **perplexity
-canary Δppl** (ADR-0008 / ADR-0018); **#2 KV occupancy** is a derived
-`B × ctx × layers × kv_elem` from the existing `LayerKv` reported alongside them.
+The remaining M4 dashboard numbers land in the following M4 PR, not this one:
+**#5 prefix-cache hit-rate** (ADR-0022 identity primitive); **#2 KV occupancy** is a
+derived `B × ctx × layers × kv_elem` from the existing `LayerKv` reported alongside it.
 
 ### Deferred — real-party numbers (#6 stays open)
 
@@ -558,4 +591,14 @@ KENNY_MODEL_DIR=<model_dir> bash tools/netem-bench.sh --nodes 3 --placement
 # tests/dispatch.rs::placed_* + placed_records_per_node_latency and
 # node::apply_hold_* — placed ≡ local bit-exact, the shard partition, per-node
 # latency plumbing — all in `cargo test`.
+
+# Perplexity canary — fp8 vs bf16-source Δppl (dashboard #3).
+# CLI (fp8 carve + bf16 source model):
+kenny canary --carved <fp8_dir> --model <model_dir> --prompts 2 --len 16
+# Real-model gated test arm (the number in the table above):
+KENNY_MODEL_DIR=<model_dir> cargo test --release --test dispatch \
+    real_model_perplexity_canary -- --nocapture
+# Model-free deterministic arm runs in a plain `cargo test`
+# (src/canary.rs::{score_tokens_*, reference_perplexity_is_exactly_reproducible,
+#  fixture_fp8_canary_is_finite_and_deterministic}).
 ```

@@ -1731,6 +1731,79 @@ fn real_model_two_process_dispatch() {
 }
 
 // -------------------------------------------------------------------------
+// M4 — perplexity canary against the REAL Qwen3-30B-A3B (KENNY_MODEL_DIR).
+// The ADR-0008 canary corollary and the ADR-0018 deciding QUALITY axis: the
+// teacher-forced perplexity delta of the fp8 blob+wire path vs the bf16-source
+// reference. The deliverable is the BENCH Δppl number, not a pass/fail — a loose
+// finiteness floor is the only assertion (the exact number is what the milestone
+// reports). Budget-capped (a small fixed prompt set) per the plan; CI never
+// downloads a model, so this is gated behind KENNY_MODEL_DIR.
+// -------------------------------------------------------------------------
+#[test]
+fn real_model_perplexity_canary() {
+    let Some(dir) = std::env::var_os("KENNY_MODEL_DIR") else {
+        eprintln!("KENNY_MODEL_DIR unset — skipping M4 real-model perplexity canary");
+        return;
+    };
+    let model_dir = PathBuf::from(dir);
+
+    // fp8 carve of the real model (dedup-skips on a warm carve, cheap to re-run).
+    let carved = Path::new(env!("CARGO_TARGET_TMPDIR")).join("real-carve-fp8");
+    std::fs::create_dir_all(&carved).unwrap();
+    carve::run(
+        &model_dir,
+        &Options {
+            out: carved.clone(),
+            model_name: "qwen3-30b-a3b".into(),
+            model_rev: String::new(),
+            dtype: Dtype::Fp8,
+        },
+    )
+    .unwrap();
+
+    // Small fixed canary set — the plan's budget cap (teacher-forced forwards are
+    // the ~9 s/forward dense cost, run once per path). Real Qwen3-30B-A3B card.
+    let opts = kenny::canary::CanaryOptions {
+        prompts: 2,
+        len: 16,
+        seed: 42,
+        codec: "fp8".into(),
+        config: Config::default(),
+    };
+    let t0 = std::time::Instant::now();
+    let r = kenny::canary::run(&model_dir, &carved, &opts).unwrap();
+    eprintln!(
+        "M4 canary ({} seq x {} tok, {} scored) in {:.1?}: ppl(fp8)={:.4} ppl(bf16-source)={:.4} \
+         Δppl={:+.4} | nll fp8={:.5} ref={:.5}",
+        r.prompts,
+        r.prompt_len,
+        r.scored_tokens,
+        t0.elapsed(),
+        r.ppl_test,
+        r.ppl_ref,
+        r.delta_ppl,
+        r.nll_test,
+        r.nll_ref,
+    );
+    assert!(
+        r.ppl_test.is_finite() && r.ppl_test > 0.0,
+        "fp8 perplexity is not a finite positive number: {}",
+        r.ppl_test
+    );
+    assert!(
+        r.ppl_ref.is_finite() && r.ppl_ref > 0.0,
+        "bf16-source perplexity is not a finite positive number: {}",
+        r.ppl_ref
+    );
+    assert!(
+        r.delta_ppl.is_finite(),
+        "Δppl is not finite: {}",
+        r.delta_ppl
+    );
+    assert_eq!(r.scored_tokens, 2 * 15, "prompts x (len - 1) transitions");
+}
+
+// -------------------------------------------------------------------------
 // M2 — localhost batching B-sweep against the REAL Qwen3-30B-A3B
 // (KENNY_MODEL_DIR). The M2 deliverable is BENCH.md numbers, not a pass/fail:
 // aggregate tok/s and per-STEP median/p99 as batch size B rises, plus exact

@@ -1492,6 +1492,35 @@ impl Spine {
         Ok(logits)
     }
 
+    /// Teacher-forced per-position logits: prefill `tokens` and return the vocab
+    /// logits at EVERY position (position `i`'s distribution predicts token
+    /// `i + 1`). Where [`Spine::logits`] keeps only the final position, the
+    /// perplexity canary (ADR-0008) needs every position's distribution to score
+    /// each observed next token. Teacher-forced means the TRUE `tokens` are always
+    /// fed (never the model's own argmax), so two dispatch paths — the fp8
+    /// blob+wire path and the bf16-source reference — see identical input at every
+    /// position and the resulting `Δppl` is well defined (no greedy divergence).
+    /// Output vector `i` is `forward_token(tokens[i], i, ..)`, so a single
+    /// left-to-right prefill fills the causal KV cache exactly as generation would.
+    pub fn logits_per_position(
+        &self,
+        dispatcher: &mut dyn Dispatcher,
+        tokens: &[u32],
+    ) -> Result<Vec<Vec<f32>>> {
+        if tokens.is_empty() {
+            return Err(Error::usage(
+                "spine: canary prompt must have at least one token",
+            ));
+        }
+        let mut stats = GenStats::default();
+        let mut kv: Vec<LayerKv> = (0..self.layers.len()).map(|_| LayerKv::default()).collect();
+        let mut per_pos = Vec::with_capacity(tokens.len());
+        for (pos, &tok) in tokens.iter().enumerate() {
+            per_pos.push(self.forward_token(tok, pos, &mut kv, dispatcher, &mut stats)?);
+        }
+        Ok(per_pos)
+    }
+
     /// One forward pass for `tok` at `pos`, returning the vocab logits.
     fn forward_token(
         &self,
