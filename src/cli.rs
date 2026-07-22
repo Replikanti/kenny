@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use crate::blob::Dtype;
+use crate::canary;
 use crate::carve;
 use crate::diff;
 use crate::error::{Error, Result};
@@ -86,6 +87,22 @@ USAGE:
         replica-set hedge on the placed path: a stalled primary's experts spill to
         their next replica, first-answer-wins (the multi-node analogue of the
         single-node --layer-timeout-ms; default off).
+
+    kenny canary --carved <fp8_dir> --model <model_dir>
+                 [--prompts N] [--len N] [--seed N] [--codec fp8|bf16]
+                 [--num-heads N] [--num-kv-heads N] [--head-dim N]
+                 [--rope-theta N] [--rms-eps-ppm N] [--top-k N]
+        The ADR-0008 perplexity canary: teacher-forced perplexity of the carved
+        blob+wire path (default fp8) vs the bf16-source reference (the diff.rs
+        source-matrix path, no quant, no codec), over a fixed seed-keyed prompt
+        set, and print Δppl = ppl(test) − ppl(ref). This is the deciding QUALITY
+        axis ADR-0018 is blocked on. --prompts N sequences x --len N tokens
+        (default 4 x 16); both paths hold every expert so nothing renorms and the
+        number is pure quantization quality. Hyperparameter flags default to the
+        Qwen3-30B-A3B card, exactly like `kenny spine`; the fixture (square
+        attention) loads only at --num-heads 1 --num-kv-heads 1 --head-dim <hidden>.
+        CI never downloads a model — run this against a real --model for a BENCH
+        Δppl (KENNY_MODEL_DIR in the gated test arm).
 ";
 
 pub fn run(args: &[String]) -> Result<()> {
@@ -99,6 +116,7 @@ pub fn run(args: &[String]) -> Result<()> {
         Some("diff") => run_diff(&args[1..]),
         Some("node") => run_node(&args[1..]),
         Some("spine") => run_spine(&args[1..]),
+        Some("canary") => run_canary(&args[1..]),
         Some(other) => Err(Error::usage(format!("unknown command {other:?}"))),
     }
 }
@@ -705,6 +723,105 @@ fn run_spine(args: &[String]) -> Result<()> {
                 .join(", ")
         );
     }
+    Ok(())
+}
+
+fn run_canary(args: &[String]) -> Result<()> {
+    let mut carved: Option<PathBuf> = None;
+    let mut model: Option<PathBuf> = None;
+    let mut opts = canary::CanaryOptions::default();
+    let mut rms_eps_ppm = 1u64; // 1e-6, resolved into cfg below
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--carved" => carved = Some(PathBuf::from(value(args, &mut i, "--carved")?)),
+            "--model" => model = Some(PathBuf::from(value(args, &mut i, "--model")?)),
+            "--prompts" => {
+                opts.prompts =
+                    parse_num(value(args, &mut i, "--prompts")?, "--prompts", 1, 1 << 16)? as usize;
+            }
+            "--len" => {
+                opts.len = parse_num(value(args, &mut i, "--len")?, "--len", 2, 1 << 16)? as usize;
+            }
+            "--seed" => {
+                opts.seed = parse_num(value(args, &mut i, "--seed")?, "--seed", 0, u64::MAX)?
+            }
+            "--codec" => opts.codec = value(args, &mut i, "--codec")?.to_string(),
+            "--num-heads" => {
+                opts.config.num_heads = parse_num(
+                    value(args, &mut i, "--num-heads")?,
+                    "--num-heads",
+                    1,
+                    1 << 16,
+                )? as usize;
+            }
+            "--num-kv-heads" => {
+                opts.config.num_kv_heads = parse_num(
+                    value(args, &mut i, "--num-kv-heads")?,
+                    "--num-kv-heads",
+                    1,
+                    1 << 16,
+                )? as usize;
+            }
+            "--head-dim" => {
+                opts.config.head_dim =
+                    parse_num(value(args, &mut i, "--head-dim")?, "--head-dim", 2, 1 << 16)?
+                        as usize;
+            }
+            "--rope-theta" => {
+                opts.config.rope_theta = parse_num(
+                    value(args, &mut i, "--rope-theta")?,
+                    "--rope-theta",
+                    1,
+                    u64::MAX,
+                )? as f64;
+            }
+            "--rms-eps-ppm" => {
+                rms_eps_ppm = parse_num(
+                    value(args, &mut i, "--rms-eps-ppm")?,
+                    "--rms-eps-ppm",
+                    0,
+                    1 << 30,
+                )?;
+            }
+            "--top-k" => {
+                opts.config.top_k =
+                    parse_num(value(args, &mut i, "--top-k")?, "--top-k", 1, 1 << 16)? as usize;
+            }
+            other => {
+                return Err(Error::usage(format!(
+                    "canary: unexpected argument {other:?}"
+                )));
+            }
+        }
+        i += 1;
+    }
+    opts.config.rms_eps = spine::eps_from_ppm(rms_eps_ppm);
+    let carved = carved.ok_or_else(|| Error::usage("canary: --carved is required"))?;
+    let model = model.ok_or_else(|| Error::usage("canary: --model is required"))?;
+
+    let r = canary::run(&model, &carved, &opts)?;
+    println!(
+        "canary:   {} sequences x {} tokens ({} scored), seed {}, blobs {}, wire {}",
+        r.prompts,
+        r.prompt_len,
+        r.scored_tokens,
+        opts.seed,
+        r.dtype.name(),
+        r.codec
+    );
+    println!(
+        "ppl:      test ({}) {:.6}   ref (bf16-source) {:.6}",
+        r.codec, r.ppl_test, r.ppl_ref
+    );
+    println!(
+        "nll:      test {:.6}   ref {:.6} (nats/token)",
+        r.nll_test, r.nll_ref
+    );
+    println!(
+        "delta:    Δppl {:+.6} (test − ref) — ADR-0008 canary / ADR-0018 quality axis",
+        r.delta_ppl
+    );
     Ok(())
 }
 

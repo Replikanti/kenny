@@ -7,6 +7,7 @@
 
 pub mod bf16;
 pub mod blob;
+pub mod canary;
 pub mod carve;
 pub mod cli;
 pub mod diff;
