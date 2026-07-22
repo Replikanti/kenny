@@ -145,6 +145,34 @@ impl Node {
         Ok(Some(yb))
     }
 
+    /// Run one expert on a DECODED activation exactly as the served path does —
+    /// forward then codec-encode `y` — and return the DECODED `y` (or `None` if
+    /// not held). This is the in-process mirror the spine's `LocalDispatch`
+    /// uses: it applies the same `codec.encode`/`decode` round-trip the wire
+    /// applies, so a local run is bit-identical to a dispatched one by
+    /// construction (ADR-0018). The caller must pass `x` already run through
+    /// `codec.decode(codec.encode(x))`, mirroring what the node sees off the wire.
+    pub fn run_local(
+        &mut self,
+        layer: u16,
+        expert: u16,
+        x: &[f32],
+        codec: &dyn WireCodec,
+    ) -> Result<Option<Vec<f32>>> {
+        match self.run_expert(layer, expert, x, codec)? {
+            Some(yb) => Ok(Some(codec.decode(&yb)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Drop an expert from this node's index so it answers `not-held` — the
+    /// replica-loss scenario ADR-0008's renorm exists for. Returns whether the
+    /// entry was present. Used to exercise the spine's renorm path with a node
+    /// (and its `LocalDispatch` mirror) that has legitimately lost a replica.
+    pub fn drop_expert(&mut self, layer: u16, expert: u16) -> bool {
+        self.index.remove(&(layer, expert)).is_some()
+    }
+
     /// Serve one connection: verify the handshake, then answer dispatches until
     /// the peer hangs up. Returns the session stats.
     pub fn serve_connection<S: Read + Write>(&mut self, stream: S) -> Result<ServeStats> {
