@@ -21,6 +21,7 @@ pub mod node;
 pub mod quant;
 pub mod rng;
 pub mod safetensors;
+pub mod spine;
 pub mod wire;
 
 pub use error::{Error, Result};
