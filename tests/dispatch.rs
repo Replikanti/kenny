@@ -90,6 +90,61 @@ fn via_local(
     spine.generate(&mut d, prompt, tokens).unwrap()
 }
 
+/// Batched twin of `via_local`: advance B streams in lockstep through an
+/// in-process node, optionally dropping experts (lost replicas, renorm path).
+fn via_local_batch(
+    spine: &Spine,
+    carved: &Path,
+    which: &str,
+    prompts: &[&[u32]],
+    tokens: usize,
+    forget: &[(u16, u16)],
+) -> (Vec<Vec<u32>>, spine::GenStats) {
+    let mut d = LocalDispatch::new(carved, make_codec(which)).unwrap();
+    for &(l, e) in forget {
+        assert!(d.node_mut().drop_expert(l, e), "expert to drop must exist");
+    }
+    spine.generate_batch(&mut d, prompts, tokens).unwrap()
+}
+
+/// Batched twin of `via_node`: B streams over ONE TCP connection to a real node
+/// in a background thread. The batched `NodeDispatch` pipelines the B round-trips
+/// (ADR-0023); the node's serve loop is unchanged (a faster-arriving stream of
+/// the same dispatch/gather frames).
+fn via_node_batch(
+    spine: &Spine,
+    carved: &Path,
+    which: &str,
+    prompts: &[&[u32]],
+    tokens: usize,
+    forget: &[(u16, u16)],
+) -> (Vec<Vec<u32>>, spine::GenStats) {
+    let manifest = Manifest::load(&carved.join(manifest::FILE_NAME)).unwrap();
+    let identity = *blake3::hash(&manifest.canonical_bytes()).as_bytes();
+    let hidden = manifest.model.hidden as usize;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let carved = carved.to_path_buf();
+    let forget = forget.to_vec();
+    let server = thread::spawn(move || {
+        let mut node = Node::load(&carved).unwrap();
+        for &(l, e) in &forget {
+            assert!(node.drop_expert(l, e), "expert to drop must exist");
+        }
+        let (sock, _) = listener.accept().unwrap();
+        node.serve_connection(sock).unwrap()
+    });
+
+    let mut dispatch =
+        NodeDispatch::connect(&addr.to_string(), make_codec(which), identity, hidden).unwrap();
+    let out = spine
+        .generate_batch(&mut dispatch, prompts, tokens)
+        .unwrap();
+    drop(dispatch); // hang up so the node's serve loop ends
+    server.join().unwrap();
+    out
+}
+
 /// Generate through a real TCP node in a background thread. The node's manifest
 /// identity and hidden size are derived from the carve, keeping the arg list lean.
 fn via_node(
@@ -144,6 +199,64 @@ fn local_equals_node_bit_exact() {
     }
 }
 
+/// THE M2 GATE: batched local ≡ batched node, bit-for-bit, under BOTH codecs.
+/// The pipelined `NodeDispatch::dispatch_batch` (writer thread + concurrent
+/// gather drain, ADR-0023) must reproduce the sequential `LocalDispatch` default
+/// batch loop exactly — proving the composed-wire pipeline is output-faithful.
+#[test]
+fn local_equals_node_bit_exact_batched() {
+    let root = tmp("equiv-batch");
+    let (model, carved) = fixture_and_carve(&root);
+    let manifest = Manifest::load(&carved.join(manifest::FILE_NAME)).unwrap();
+    let hidden = manifest.model.hidden as usize;
+    let spine = Spine::load(&model, &manifest, config(hidden, 2)).unwrap();
+    // Four independent streams, equal length (rectangular batch).
+    let prompts: Vec<&[u32]> = vec![&[1, 2, 3], &[3, 2, 1], &[2, 3, 1], &[1, 3, 2]];
+
+    for which in ["fp8", "bf16"] {
+        let (local, _) = via_local_batch(&spine, &carved, which, &prompts, 6, &[]);
+        let (node, _) = via_node_batch(&spine, &carved, which, &prompts, 6, &[]);
+        assert_eq!(
+            local, node,
+            "codec {which}: batched dispatched path must reproduce the in-process path bit-for-bit"
+        );
+    }
+}
+
+/// THE strong M2 invariant: batching is OUTPUT-INVARIANT. A batch of B independent
+/// streams reproduces each stream generated ALONE (B = 1), token-for-token — the
+/// property that makes `GOLDEN_SPINE_TOKENS` immune to the batch path. Any drift
+/// here is a batching bug, not a legitimate spine-math change.
+#[test]
+fn batch_equals_serial() {
+    let root = tmp("batch-serial");
+    let (model, carved) = fixture_and_carve(&root);
+    let manifest = Manifest::load(&carved.join(manifest::FILE_NAME)).unwrap();
+    let hidden = manifest.model.hidden as usize;
+    let spine = Spine::load(&model, &manifest, config(hidden, 2)).unwrap();
+    let prompts: Vec<&[u32]> = vec![&[1, 2, 3], &[3, 2, 1], &[2, 3, 1]];
+    let tokens = 6usize;
+
+    // Each stream generated alone (single-stream B = 1 path).
+    let solo: Vec<Vec<u32>> = prompts
+        .iter()
+        .map(|p| via_local(&spine, &carved, "fp8", p, tokens, &[]).0)
+        .collect();
+
+    // The whole batch together, both dispatch paths.
+    let (batched_local, _) = via_local_batch(&spine, &carved, "fp8", &prompts, tokens, &[]);
+    let (batched_node, _) = via_node_batch(&spine, &carved, "fp8", &prompts, tokens, &[]);
+
+    assert_eq!(
+        batched_local, solo,
+        "batched local == each stream generated alone"
+    );
+    assert_eq!(
+        batched_node, solo,
+        "batched node == each stream generated alone"
+    );
+}
+
 /// Wire bytes are counted at the socket and accountable PER DIRECTION with exact
 /// framing (A5): x is sent once per dispatch (up), each answering expert returns
 /// its own y (down) — the two directions are NOT symmetric.
@@ -185,6 +298,46 @@ fn wire_bytes_match_per_direction_accounting() {
         assert_eq!(stats.wire_down, down, "codec {which}: down bytes");
         // The asymmetry is real: down carries k payloads per dispatch, up one.
         assert!(stats.wire_down > stats.wire_up, "codec {which}: down > up");
+    }
+}
+
+/// Batched wire accounting (M2): B streams compose as B independent frame pairs
+/// per MoE layer per step (ADR-0023), so the M1 per-direction formula holds with
+/// the dispatch count scaled by B — one handshake, then B x the single-stream
+/// dispatch/gather framing. This is the byte-level proof that batching adds no
+/// new wire shape.
+#[test]
+fn wire_bytes_match_per_direction_accounting_batched() {
+    let root = tmp("wirebytes-batch");
+    let (model, carved) = fixture_and_carve(&root);
+    let manifest = Manifest::load(&carved.join(manifest::FILE_NAME)).unwrap();
+    let hidden = manifest.model.hidden as usize;
+    let spine = Spine::load(&model, &manifest, config(hidden, 2)).unwrap();
+    let prompts: Vec<&[u32]> = vec![&[1, 2, 3], &[3, 2, 1], &[2, 3, 1], &[1, 3, 2]];
+    let b = prompts.len() as u64;
+    let tokens = 6usize;
+
+    for which in ["fp8", "bf16"] {
+        let (_out, stats) = via_node_batch(&spine, &carved, which, &prompts, tokens, &[]);
+
+        let elem = make_codec(which).elem_bytes();
+        let k = spine.experts_per_step() as u64;
+        let moe_layers = manifest.model.moe_layers as u64;
+        // Per-stream forwards; one dispatch FRAME per stream per MoE layer.
+        let forwards = (prompts[0].len() + tokens - 1) as u64;
+        let dispatches = b * forwards * moe_layers;
+        assert_eq!(
+            stats.dispatches, dispatches,
+            "codec {which}: B x dispatch count"
+        );
+
+        let payload = (hidden * elem) as u64;
+        // One handshake for the connection, then B x the M1 per-dispatch framing.
+        let up = HANDSHAKE_LEN as u64 + dispatches * (DISPATCH_HEADER_LEN as u64 + payload + 2 * k);
+        let down = dispatches
+            * (GATHER_HEADER_LEN as u64 + GATHER_RECORD_HEADER_LEN as u64 * k + payload * k);
+        assert_eq!(stats.wire_up, up, "codec {which}: batched up bytes");
+        assert_eq!(stats.wire_down, down, "codec {which}: batched down bytes");
     }
 }
 
@@ -262,6 +415,75 @@ fn renorm_over_answered_subset() {
         all_present_down - node_stats.wire_down,
         forwards * (k - 1) * payload,
         "the down-byte shortfall equals exactly the missing experts' y payloads"
+    );
+}
+
+/// Batched renorm (M2): the ADR-0008 not-held path is PER STREAM. With layer 0
+/// missing three of four replicas, every stream renorms every forward at layer 0
+/// and nowhere else; batched local ≡ batched node, and the aggregate down-byte
+/// shortfall is exactly the missing y payloads summed over all B streams.
+#[test]
+fn renorm_over_answered_subset_batched() {
+    let root = tmp("renorm-batch");
+    let (model, carved) = fixture_and_carve(&root);
+    let manifest = Manifest::load(&carved.join(manifest::FILE_NAME)).unwrap();
+    let hidden = manifest.model.hidden as usize;
+    let experts = manifest.model.experts_per_layer as usize;
+    let spine = Spine::load(&model, &manifest, config(hidden, experts)).unwrap();
+    let prompts: Vec<&[u32]> = vec![&[1, 2, 3], &[3, 2, 1], &[2, 3, 1]];
+    let b = prompts.len() as u64;
+    // Three of layer 0's four replicas are down on the (single) node.
+    let lost = [(0u16, 0u16), (0, 1), (0, 2)];
+    let tokens = 6usize;
+
+    let (drop_local, drop_stats) =
+        via_local_batch(&spine, &carved, "bf16", &prompts, tokens, &lost);
+    let (drop_node, node_stats) = via_node_batch(&spine, &carved, "bf16", &prompts, tokens, &lost);
+
+    assert_eq!(
+        drop_local, drop_node,
+        "batched renorm path: local must equal node"
+    );
+    assert!(drop_stats.renorm_steps > 0, "renorm must have fired");
+    assert!(
+        drop_local
+            .iter()
+            .flatten()
+            .all(|&t| (t as usize) < spine.vocab()),
+        "renormed batched output stays finite / in-vocab"
+    );
+
+    let elem = make_codec("bf16").elem_bytes();
+    let payload = (hidden * elem) as u64;
+    let k = spine.experts_per_step() as u64;
+    let moe_layers = manifest.model.moe_layers as u64;
+    let forwards = (prompts[0].len() + tokens - 1) as u64;
+    // Every stream renorms layer 0 on every forward, and only there.
+    assert_eq!(
+        drop_stats.renorm_steps,
+        b * forwards,
+        "one renorm/stream/forward at layer 0"
+    );
+
+    // Aggregate framing: B streams x (gather header + one record header per
+    // requested expert) per dispatch; y payloads only for the answered experts.
+    let frame = b
+        * forwards
+        * moe_layers
+        * (GATHER_HEADER_LEN as u64 + GATHER_RECORD_HEADER_LEN as u64 * k);
+    let answered_ys = b * forwards * (1 + k * (moe_layers - 1));
+    let expect_down = frame + answered_ys * payload;
+    assert_eq!(
+        node_stats.wire_down, expect_down,
+        "batched renorm down bytes: header per requested expert, y only for the answered ones"
+    );
+    // Strictly fewer down bytes than an all-present run: each stream drops (k-1)
+    // layer-0 y payloads per forward.
+    let all_present_down = frame + b * forwards * k * moe_layers * payload;
+    assert_eq!(
+        all_present_down - node_stats.wire_down,
+        b * forwards * (k - 1) * payload,
+        "the down-byte shortfall equals exactly the missing experts' y payloads, per stream"
     );
 }
 

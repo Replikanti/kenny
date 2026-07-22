@@ -49,17 +49,20 @@ USAGE:
         does not hold answer not-held (feeds the spine's renorm, ADR-0008).
 
     kenny spine --carved <dir> --model <model_dir> (--node <addr> | --local)
-                [--tokens N] [--prompt id,id,...] [--codec fp8|bf16] [--seed N]
-                [--num-heads N] [--num-kv-heads N] [--head-dim N]
+                [--tokens N] [--prompt id,id,...] [--batch N] [--codec fp8|bf16]
+                [--seed N] [--num-heads N] [--num-kv-heads N] [--head-dim N]
                 [--rope-theta N] [--rms-eps-ppm N] [--top-k N]
         Run the Qwen3-30B-A3B spine-sim (ADR-0020): a pure-Rust dense forward
         whose MoE FFN is dispatched to a node (--node) or run in-process
         (--local). Reads the always-on tensors from <model_dir> by the manifest's
         byte ranges and greedily generates --tokens tokens, printing tok/s and
-        wire bytes counted at the socket. Hyperparameter flags default to the
-        Qwen3-30B-A3B card (head-dim 128 != hidden/num-heads; rope-theta
-        10000000; rms-eps-ppm 1 = 1e-6); the fixture (square attention) loads
-        only at --num-heads 1 --num-kv-heads 1 --head-dim <hidden>.
+        wire bytes counted at the socket. --batch N advances N independent streams
+        in lockstep (ADR-0006 / ADR-0023: aggregate tok/s is the product); N > 1
+        derives N distinct seed-keyed prompts (so --prompt is single-stream only)
+        and reports aggregate tok/s over N x --tokens tokens. Hyperparameter flags
+        default to the Qwen3-30B-A3B card (head-dim 128 != hidden/num-heads;
+        rope-theta 10000000; rms-eps-ppm 1 = 1e-6); the fixture (square attention)
+        loads only at --num-heads 1 --num-kv-heads 1 --head-dim <hidden>.
 ";
 
 pub fn run(args: &[String]) -> Result<()> {
@@ -328,6 +331,7 @@ fn run_spine(args: &[String]) -> Result<()> {
     let mut nodes: Vec<String> = Vec::new();
     let mut local = false;
     let mut tokens = 16usize;
+    let mut batch = 1usize;
     let mut prompt: Option<Vec<u32>> = None;
     let mut codec_name = String::from("fp8");
     let mut seed = 42u64;
@@ -343,6 +347,12 @@ fn run_spine(args: &[String]) -> Result<()> {
             "--tokens" => {
                 tokens =
                     parse_num(value(args, &mut i, "--tokens")?, "--tokens", 1, 1 << 20)? as usize;
+            }
+            "--batch" => {
+                // Cap at 4096: past that the fp8 payloads bound B_max well before
+                // the framing does (MANIFESTO §4.4), and it keeps the per-stream
+                // Vec allocations sane on the spine.
+                batch = parse_num(value(args, &mut i, "--batch")?, "--batch", 1, 4096)? as usize;
             }
             "--prompt" => prompt = Some(parse_prompt(value(args, &mut i, "--prompt")?)?),
             "--codec" => codec_name = value(args, &mut i, "--codec")?.to_string(),
@@ -429,14 +439,23 @@ fn run_spine(args: &[String]) -> Result<()> {
         }
     };
 
-    // Default prompt: a short deterministic token sequence from --seed, so a
-    // run is reproducible without needing an explicit --prompt.
-    let prompt = prompt.unwrap_or_else(|| {
-        let mut rng = SplitMix64::for_name(seed, "spine.prompt");
-        (0..4)
-            .map(|_| (rng.next_u64() % spine.vocab() as u64) as u32)
+    // Build the batch of prompts. B = 1 keeps the single-stream path (explicit
+    // --prompt or a seed-derived default). B > 1 derives B DISTINCT prompts, one
+    // per stream index keyed off --seed, so the streams route independently; an
+    // explicit --prompt is single-stream only (batched prompts are seed-derived).
+    let prompts: Vec<Vec<u32>> = if batch == 1 {
+        vec![prompt.unwrap_or_else(|| seed_prompt(seed, 0, spine.vocab()))]
+    } else {
+        if prompt.is_some() {
+            return Err(Error::usage(
+                "spine: --prompt is single-stream; with --batch N > 1 prompts are seed-derived",
+            ));
+        }
+        (0..batch)
+            .map(|s| seed_prompt(seed, s, spine.vocab()))
             .collect()
-    });
+    };
+    let prompt_refs: Vec<&[u32]> = prompts.iter().map(Vec::as_slice).collect();
 
     let mut dispatcher: Box<dyn spine::Dispatcher> = if local {
         Box::new(LocalDispatch::new(&carved, codec)?)
@@ -444,7 +463,7 @@ fn run_spine(args: &[String]) -> Result<()> {
         Box::new(NodeDispatch::connect(&nodes[0], codec, identity, hidden)?)
     };
 
-    let (out, stats) = spine.generate(dispatcher.as_mut(), &prompt, tokens)?;
+    let (outs, stats) = spine.generate_batch(dispatcher.as_mut(), &prompt_refs, tokens)?;
 
     let where_ = if local {
         "local (in-process)".to_string()
@@ -466,13 +485,24 @@ fn run_spine(args: &[String]) -> Result<()> {
         codec_name
     );
     println!("dispatch: {where_}");
-    println!(
-        "prompt:   {} tokens -> generated {} (vocab {})",
-        stats.prompt_tokens,
-        stats.generated_tokens,
-        spine.vocab()
-    );
-    println!("tokens:   {out:?}");
+    if batch == 1 {
+        println!(
+            "prompt:   {} tokens -> generated {} (vocab {})",
+            stats.prompt_tokens,
+            stats.generated_tokens,
+            spine.vocab()
+        );
+        println!("tokens:   {:?}", outs[0]);
+    } else {
+        println!(
+            "batch:    {} streams x {} prompt tokens -> {} generated total (vocab {})",
+            batch,
+            stats.prompt_tokens,
+            stats.generated_tokens,
+            spine.vocab()
+        );
+        println!("tokens:   stream 0 {:?}", outs[0]);
+    }
     println!(
         "dispatch: {} frames, {}/{} experts answered, {} renorm steps",
         stats.dispatches, stats.experts_answered, stats.experts_requested, stats.renorm_steps
@@ -482,9 +512,30 @@ fn run_spine(args: &[String]) -> Result<()> {
         stats.wire_up, stats.wire_down
     );
     let (median, p99) = stats.latency_median_p99();
+    let rate = if batch == 1 {
+        "tok/s"
+    } else {
+        "tok/s aggregate"
+    };
     println!(
-        "speed:    {tok_s:.1} tok/s ({:.3} s); per-forward median {:.1?}, p99 {:.1?}",
+        "speed:    {tok_s:.1} {rate} ({:.3} s); per-step median {:.1?}, p99 {:.1?}",
         secs, median, p99
     );
     Ok(())
+}
+
+/// A short deterministic prompt for stream `s`, keyed by `(seed, s)` so distinct
+/// streams route independently and a run is reproducible without an explicit
+/// `--prompt`. Stream 0 keeps the pre-batch key so single-stream runs are
+/// byte-stable across this change.
+fn seed_prompt(seed: u64, s: usize, vocab: usize) -> Vec<u32> {
+    let name = if s == 0 {
+        "spine.prompt".to_string()
+    } else {
+        format!("spine.prompt.{s}")
+    };
+    let mut rng = SplitMix64::for_name(seed, &name);
+    (0..4)
+        .map(|_| (rng.next_u64() % vocab as u64) as u32)
+        .collect()
 }
