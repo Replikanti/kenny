@@ -47,6 +47,47 @@ and lands in BENCH "M4 — perplexity canary". This is also the deciding quality
 ADR-0018 was blocked on. The **heat-map alarm** half already shipped with placement
 (`PlacedDispatch::suspect_replicas`, M4 PR2). Both dashboard corollaries are now real.
 
+### M5.A update (2026-07-22) — degradation MEASURED during correlated churn
+
+The renorm was proven to bridge a single missing replica (M4). M5.A proves it
+bridges the harder failure this ADR was written for: a whole **failure domain**
+dying together. The in-process locks (`tests/dispatch.rs`, model-free, netns-free)
+stand up a pool whose nodes SHARE failure domains, kill a domain mid-run (its
+nodes go black hole while the placement map still points at them — the down-window
+before an operator re-places), and assert the three things "no step ever stalls;
+churn shows up as a smooth quality dip, not an outage" requires:
+
+- **`churn_domain_renorms_and_completes`** — a correlated-domain kill neither
+  stalls nor errors: the replica-set budget (`hedge_delay`) stalls each silent
+  node so the renorm bridges the gap, the run COMPLETES, and the stranded experts
+  renorm bit-for-bit like a local run that dropped exactly that set
+  (`renorm_steps > 0`, degradation measured not silent). A re-place over the
+  survivors then restores full coverage — the elasticity round-trip.
+- **`churn_flags_dead_replicas`** — the stranded domain's experts (dispatched
+  every step, answered on none) are surfaced EXACTLY by
+  `PlacedDispatch::suspect_replicas` (`HeatMap::suspect`), and the survivors' are
+  not: the "creeping capacity loss is never silent" half, measured off spine-local
+  heat, never on the wire.
+- **`renorm_quality_dip_grows_with_dropout`** — the canary corollary under
+  dropout: as the fraction of experts forced not-held GROWS, the renormed output
+  diverges monotonically from the full-coverage answer (scored through the canary's
+  own `Spine::logits_per_position`) and returns EXACTLY to baseline when coverage
+  is restored. HONEST CAVEAT (ADR-0007): the canary NLL drifts toward the ln(vocab)
+  floor under dropout rather than strictly worsening — and the `KENNY_MODEL_DIR`
+  arm (`renorm_quality_dip_real_model`, BENCH "M5.A — elasticity") shows the REAL
+  Qwen3-30B-A3B doing the SAME on random canary prompts (perplexity 1.1e7 → 4.0e6
+  as experts drop), because kenny has no tokenizer yet: random next-tokens carry no
+  signal for an expert to preserve. The SIGN of a real quality dip needs real TEXT
+  prompts (deferred); the robust model-free signal is the divergence-from-full
+  metric, and the real card confirms only that the renorm path stays finite and
+  deterministic under heavy dropout.
+
+The shaped-uplink netns SIMULATION (`netem_churn`, `tools/netem-bench.sh --churn`)
+additionally surfaces a real ADR-0010 × ADR-0008 interaction: a replica-set budget
+tighter than a slow-but-healthy survivor's round-trip false-flags that survivor
+suspect — the budget must clear the slowest uplink. All of the above is
+spine-local: `WIRE_VERSION` and every wire golden stay frozen (ADR-0024).
+
 ## Alternatives considered
 
 - **Block / retry until the expert answers** — hands tail latency to the slowest

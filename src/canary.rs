@@ -118,11 +118,11 @@ pub fn run(model_dir: &Path, carved_dir: &Path, opts: &CanaryOptions) -> Result<
 
     // Test path: carved blobs + the wire codec (the fp8 blob+wire path).
     let mut test = LocalDispatch::new(carved_dir, make_codec(&codec_name)?)?;
-    let (nll_test_sum, count_test) = perplexity(&spine, &mut test, &prompts)?;
+    let (nll_test_sum, count_test) = teacher_forced_nll(&spine, &mut test, &prompts)?;
 
     // Reference path: bf16 source matrices, no quant, no codec.
     let mut reference = SourceRefDispatch::new(model_dir, hidden, inter)?;
-    let (nll_ref_sum, count_ref) = perplexity(&spine, &mut reference, &prompts)?;
+    let (nll_ref_sum, count_ref) = teacher_forced_nll(&spine, &mut reference, &prompts)?;
 
     // Same prompts, same scoring loop — the two counts are equal by construction.
     debug_assert_eq!(count_test, count_ref);
@@ -147,8 +147,14 @@ pub fn run(model_dir: &Path, carved_dir: &Path, opts: &CanaryOptions) -> Result<
 
 /// Sum the teacher-forced NLL over every canary sequence, one sequence at a time
 /// (so at most one sequence's per-position logits are resident — the logit
-/// matrix is `len × vocab`). Returns `(nll_sum, scored_token_count)`.
-fn perplexity(
+/// matrix is `len × vocab`). Returns `(nll_sum, scored_token_count)`; the mean
+/// NLL is `nll_sum / count` and exponentiates to perplexity.
+///
+/// Public so the ADR-0008 renorm-quality-dip lock (`tests/dispatch.rs`) scores a
+/// dropout-degraded dispatch path with the SAME teacher-forced NLL the canary
+/// uses — the "quality dip WHILE a domain is down" is measured on the exact
+/// canary metric, not a re-derived one.
+pub fn teacher_forced_nll(
     spine: &Spine,
     dispatcher: &mut dyn Dispatcher,
     prompts: &[Vec<u32>],
@@ -409,9 +415,9 @@ mod tests {
             .collect();
 
         let mut a = SourceRefDispatch::new(&model, hidden, inter).unwrap();
-        let (na, ca) = perplexity(&spine, &mut a, &prompts).unwrap();
+        let (na, ca) = teacher_forced_nll(&spine, &mut a, &prompts).unwrap();
         let mut b = SourceRefDispatch::new(&model, hidden, inter).unwrap();
-        let (nb, cb) = perplexity(&spine, &mut b, &prompts).unwrap();
+        let (nb, cb) = teacher_forced_nll(&spine, &mut b, &prompts).unwrap();
         assert_eq!((ca, cb), (3 * 5, 3 * 5), "prompts x (len - 1) transitions");
         assert_eq!(
             na.to_bits(),

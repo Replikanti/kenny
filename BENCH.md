@@ -696,3 +696,114 @@ kenny prefix --carved /tmp/c --streams 512 --system-len 4096 --user-len 512 --bl
 # shared_system_prompt_hits_after_first_stream, one_token_divergence_*,
 # hit_rate_is_deterministic, run_measures_shared_prompt_hit_rate}.
 ```
+
+## M5.A — elasticity: correlated churn + renorm-during-churn (2026-07-22)
+
+Elasticity's failure case, on top of the M4 re-placement primitive + `add_expert`
+(PR1): a whole **failure domain** dies together, and the pool must degrade
+smoothly (ADR-0008) rather than stall. All measurement here is a SIMULATION on one
+host; the real ≥20-node correlated-churn party stays M5.C / #7 (see the assumptions
+block below). Nothing on the wire moved — `WIRE_VERSION` = 1, every codec version
+1, all five wire goldens byte-identical (ADR-0024).
+
+### Renorm quality dip vs down-fraction — 8-expert × 4-layer fixture (model-free)
+
+The renormed output's divergence from the full-coverage answer (mean L2 over the
+per-position logits, scored through the canary's own `Spine::logits_per_position`)
+as a growing fraction of experts is forced not-held on every MoE layer. Monotone in
+the down-fraction and exactly 0 at full coverage — degradation is MEASURED, and the
+dip returns to exactly the baseline when coverage is restored (re-replication).
+
+| down-fraction | L2 dip from full coverage |
+|--------------:|--------------------------:|
+| 0.000         | 0.000000                  |
+| 0.125         | 0.011555                  |
+| 0.250         | 0.019563                  |
+| 0.375         | 0.024168                  |
+| 0.500         | 0.030276                  |
+| 0.625         | 0.036990                  |
+| 0.750         | 0.052849                  |
+| 0.875         | 0.069921                  |
+
+HONEST FIXTURE CAVEAT (ADR-0007): on RANDOM fixture weights the literal canary NLL
+drifts toward the ln(vocab) uniform-prior floor under dropout (3.4698 → 3.4671 over
+the same ladder) rather than strictly worsening. What the fixture locks model-free
+is the divergence-from-full signal being monotone in the down-fraction and cleanly
+recoverable — a proxy for "the output moved", NOT the direction of a quality change.
+
+### Renorm quality dip under dropout — real-model anchor (Qwen3-30B-A3B, fp8)
+
+Teacher-forced perplexity of the fp8 path as a growing fraction of experts is forced
+not-held across every MoE layer (2 sequences × 8 tokens, budget-capped; carve + run
+≈ 8.5 min on this host). Measured 2026-07-22:
+
+| down-fraction | dropped/layer | perplexity   | Δppl vs full  |
+|--------------:|--------------:|-------------:|--------------:|
+| 0.000         | 0             | 11 008 857.6 | +0.0          |
+| 0.125         | 16            |  7 714 230.6 | −3 294 627.0  |
+| 0.250         | 32            |  4 018 279.7 | −6 990 577.9  |
+
+HONEST RESULT — the real model on RANDOM canary prompts shows perplexity DROPPING
+under dropout, the SAME uniform-prior drift the fixture NLL shows, and for the same
+reason: kenny has no tokenizer yet (ADR-0007), so the prompts are random in-vocab
+tokens that carry no signal for an expert to preserve — a confidently-wrong full
+model (ppl ≈ 1.1e7) moving toward uniform under dropout LOWERS its perplexity. The
+absolute magnitude is itself the tell: these are not text perplexities. The SIGN of
+a real quality dip therefore needs real TEXT prompts (a tokenizer), which is
+deferred; until then the divergence-from-full-coverage metric above is the honest
+model-free signal, and the real card confirms only that the fp8 renorm path stays
+finite and deterministic under heavy dropout.
+
+### Correlated-churn down-window — netns SIMULATION (4 shaped nodes)
+
+Four `kenny` nodes bound to distinct loopback IPs behind their own `tc netem`
+delay+rate bands (`127.0.0.2` 20 ms/1000 Mbit, `.3` 60/100, `.4` 100/50, `.5`
+150/20), grouped into failure domains of 2. Domain `dom0` (nodes 0,1) is killed
+mid-run (black hole) while the r=1 placement map still points at it — the
+down-window before an operator re-places. The replica-set budget (600 ms here, set
+to clear the slowest uplink) stalls each silent node so the ADR-0008 renorm bridges
+the gap; the run COMPLETES, and a re-place over the survivors restores coverage.
+
+| phase        | renorm_steps | step median | step p99 | suspect flagged | dead domain holds |
+|--------------|-------------:|------------:|---------:|----------------:|------------------:|
+| down-window  | 64           | 4.81 s      | 4.82 s   | 30              | 30                |
+| re-replicated| 0            | —           | —        | —               | —                 |
+
+`suspect_replicas` flags EXACTLY the 30 experts the dead domain held (no survivor
+false-positives at this budget). CAVEAT — a real ADR-0010 × ADR-0008 interaction
+the sim surfaces: a replica-set budget TIGHTER than a slow-but-healthy survivor's
+round-trip false-flags that survivor suspect (an over-tight 120 ms budget against
+the 150 ms uplink flagged 293 experts, not 30); the budget must clear the slowest
+uplink. The step median is the down-window cost of the per-layer stall budget × the
+8 MoE barriers, not a steady-state number.
+
+### Deferred — real correlated-churn party (#7 / M5.C stays open)
+
+Everything above is a SIMULATION on one host. Its assumptions, continued from M4:
+netem-emulated per-link delay+rate on `lo` (no real ISP/geography); failure domains
+are IP groups on one host, NOT households/ISPs dying together on real geography; the
+black hole is a wedged process, not a genuine correlated outage; the budget is hand-
+tuned to the shaped delays, not a live network's tail. What the real party must show
+that the sim cannot: correlated churn across ≥20 nodes on genuine geography with
+Σ uplink ≥ 1 Gbit (ADR-0006 critical mass), a nightly churn cycle survived without
+an operator, and the GLM-5.2 card served. #7 closes when a human lands those; the
+promote-sim→real recipe (BENCH M4) carries the M5.A binaries forward unchanged.
+
+### Reproduce
+
+```
+# Model-free CI locks (no netns, no model) — plain cargo test:
+cargo test --test dispatch churn_domain_renorms_and_completes
+cargo test --test dispatch churn_flags_dead_replicas
+cargo test --test dispatch renorm_quality_dip_grows_with_dropout
+
+# Correlated-churn netns SIMULATION (unprivileged unshare -rn; 4 nodes, domains of 2):
+bash tools/netem-bench.sh --nodes 4 --churn
+KENNY_NETEM_CHURN_DOMAIN_SIZE=2 bash tools/netem-bench.sh --nodes 6 --churn
+# Unavailable netns ⇒ "netns unavailable" + exit 0. The gate is KENNY_NETEM_NODES,
+# so a plain cargo test never touches netem.
+
+# Real-model dropout-dip anchor (the perplexity table above):
+KENNY_MODEL_DIR=<model_dir> cargo test --release --test dispatch \
+    renorm_quality_dip_real_model -- --nocapture
+```
