@@ -481,6 +481,10 @@ fn run_spine(args: &[String]) -> Result<()> {
         "wire:     up {} B, down {} B",
         stats.wire_up, stats.wire_down
     );
-    println!("speed:    {tok_s:.1} tok/s ({:.3} s)", secs);
+    let (median, p99) = stats.latency_median_p99();
+    println!(
+        "speed:    {tok_s:.1} tok/s ({:.3} s); per-forward median {:.1?}, p99 {:.1?}",
+        secs, median, p99
+    );
     Ok(())
 }

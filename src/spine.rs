@@ -480,7 +480,7 @@ struct LayerKv {
 
 /// Measured generation stats (BENCH convention: numbers, not vibes). Byte counts
 /// come straight off the dispatcher's socket counters.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct GenStats {
     pub prompt_tokens: usize,
     pub generated_tokens: usize,
@@ -493,6 +493,26 @@ pub struct GenStats {
     pub wire_up: u64,
     pub wire_down: u64,
     pub elapsed: Duration,
+    /// Wall time of each forward pass, in call order (prompt-priming forwards
+    /// then generation forwards). The per-token latency distribution BENCH
+    /// reports median + p99 over (`no vibes`); empty for a `logits()` prefill.
+    pub per_forward: Vec<Duration>,
+}
+
+impl GenStats {
+    /// `(median, p99)` of the per-forward latencies (nearest-rank p99), or
+    /// `(0, 0)` if none were recorded.
+    pub fn latency_median_p99(&self) -> (Duration, Duration) {
+        if self.per_forward.is_empty() {
+            return (Duration::ZERO, Duration::ZERO);
+        }
+        let mut v = self.per_forward.clone();
+        v.sort_unstable();
+        let median = v[v.len() / 2];
+        // Nearest-rank: ceil(0.99 * n) - 1, clamped into range.
+        let rank = (((v.len() as f64) * 0.99).ceil() as usize).clamp(1, v.len()) - 1;
+        (median, v[rank])
+    }
 }
 
 /// The spine-sim: dense Qwen3 scaffolding around a dispatched MoE FFN.
@@ -566,7 +586,9 @@ impl Spine {
         // first generated token.
         let mut logits = Vec::new();
         for &tok in prompt {
+            let t = Instant::now();
             logits = self.forward_token(tok, pos, &mut kv, dispatcher, &mut stats)?;
+            stats.per_forward.push(t.elapsed());
             pos += 1;
         }
         // Emit max_new tokens; forward only to predict the NEXT one, so no extra
@@ -575,7 +597,9 @@ impl Spine {
             let next = argmax(&logits);
             tokens.push(next);
             if i + 1 < max_new {
+                let t = Instant::now();
                 logits = self.forward_token(next, pos, &mut kv, dispatcher, &mut stats)?;
+                stats.per_forward.push(t.elapsed());
                 pos += 1;
             }
         }
@@ -587,6 +611,28 @@ impl Spine {
         stats.wire_up = up;
         stats.wire_down = down;
         Ok((tokens, stats))
+    }
+
+    /// Prefill `prompt` and return the logits at its final position — the
+    /// distribution over the next token, without sampling or generating past it.
+    /// This is the seam the S7 output-sanity check compares two dispatch paths
+    /// on: run once through the fp8 path (fp8 blobs + fp8 wire) and once through
+    /// a reference path that reconstructs experts from the ORIGINAL bf16 weights
+    /// (no blob quant, no codec), then take the cosine of the two logit vectors —
+    /// the first end-to-end ADR-0018 signal, mirroring M0's fp8-vs-bf16
+    /// methodology (A6). Teacher-forced on the same prompt, so the two paths see
+    /// identical input and the number is well defined (no greedy divergence).
+    pub fn logits(&self, dispatcher: &mut dyn Dispatcher, prompt: &[u32]) -> Result<Vec<f32>> {
+        if prompt.is_empty() {
+            return Err(Error::usage("spine: prompt must have at least one token"));
+        }
+        let mut stats = GenStats::default();
+        let mut kv: Vec<LayerKv> = (0..self.layers.len()).map(|_| LayerKv::default()).collect();
+        let mut logits = Vec::new();
+        for (pos, &tok) in prompt.iter().enumerate() {
+            logits = self.forward_token(tok, pos, &mut kv, dispatcher, &mut stats)?;
+        }
+        Ok(logits)
     }
 
     /// One forward pass for `tok` at `pos`, returning the vocab logits.

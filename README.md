@@ -17,10 +17,13 @@ beefy workstation down to the Raspberry Pi in your drawer.
 - Built for **async agent farms** — hundreds of parallel streams, aggregate
   throughput. Explicitly not a chatbot.
 
-**Status:** M0 complete. Real Qwen3-30B-A3B carves into 6,144
-content-addressed expert blobs in ~67 s on a laptop and reassembles
-**bit-exactly** (`kenny diff`); fp8/int8 per-channel carve modes are measured
-in [BENCH.md](BENCH.md). Next: M1 — the dispatch/gather protocol.
+**Status:** M1 complete. A `kenny spine` (pure-Rust Qwen3-30B-A3B forward) and a
+`kenny node` run as two processes over localhost, routing every MoE layer's
+experts across the wire — and the dispatched fp8 path reproduces the in-process
+path **bit-for-bit**. Real end-to-end numbers (tok/s, wire bytes at the socket,
+fp8-vs-bf16 cosine) are in [BENCH.md](BENCH.md). M0 still holds: real
+Qwen3-30B-A3B carves into 6,144 content-addressed expert blobs in ~67 s and
+reassembles bit-exactly (`kenny diff`). Next: M2.
 
 - The what and why: [docs/MANIFESTO.md](docs/MANIFESTO.md)
 - The decisions: [docs/ADR/](docs/ADR/)
