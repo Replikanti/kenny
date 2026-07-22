@@ -876,3 +876,61 @@ KENNY_MODEL_DIR=<model_dir> cargo test --release --test dispatch \
 kenny spine --carved <fp8_dir> --model <model_dir> \
     --node <a> --node <b> --verify-frac 100
 ```
+
+## M5 — milestone closeout: elasticity + verification on Qwen3, GLM party deferred (2026-07-22)
+
+M5's single-host-buildable scope is complete. Two capabilities shipped as
+spine-LOCAL Rust, each with model-free CI locks and a real-model anchor on
+Qwen3-30B-A3B; the GLM-5.2 numeric machinery stays design (ADR-0025 `proposed`,
+ADR-0007 consequences checklist), never untested scaffolding on a card that lacks
+it. The per-section numbers + SIMULATION assumptions live in the M5.A and M5.B
+sections above — this is the consolidation, not new measurement.
+
+Landed this milestone (sim + fixtures + Qwen3 anchors):
+
+- **M5.A — elasticity.** The live re-placement primitive + `Node::add_expert`
+  (the join/leave/migrate mechanism), a correlated-churn down-window that renorms
+  and completes without an operator, a dead-replica `suspect` alarm flagging
+  exactly the dead domain's experts (30/30, no survivor false-positives at a
+  budget clearing the slowest uplink), and a renorm quality-dip signal monotone
+  in the down-fraction and cleanly recoverable (ADR-0008/ADR-0009). See "M5.A —
+  elasticity" above.
+- **M5.B — verification spot-checks.** Tolerance-based spot-check plumbing
+  (`VerifyingDispatch` decorator + spine-local per-node trust tally): the honest
+  fp8 pool raises ZERO false distrust and a byzantine node is caught on real
+  dimensions (ADR-0015 flipped to accepted). See "M5.B — verification
+  spot-checks" above.
+
+Design-only, no code (would be untested scaffolding on Qwen3, ADR-0007):
+
+- **Shared-expert × renorm × failure semantics** — ADR-0025 (`proposed`);
+  numerics confirmed at the GLM party (M5.C).
+- **DSA sparse attention, MTP speculative decoding** — GLM-specific, absent from
+  Qwen3; carried in the ADR-0007 consequences checklist, untested until the real
+  card.
+
+Nothing on the wire moved across the whole milestone: `WIRE_VERSION` = 1, every
+codec version 1, all five wire goldens byte-identical (ADR-0024) — confirmed by
+`kenny-format-auditor` on each PR touching `node.rs`/dispatch.
+
+### Deferred — M5.C exit criterion (#7 stays OPEN)
+
+M5.A + M5.B are the sim/fixtures/Qwen3 half. M5.C is the real-party exit and is
+NOT attempted on this host (GLM-5.2's carve — ~740 GB fp8 — exceeds the free disk
+here, and no real ≥20-node party exists). #7 closes only when a human lands ALL
+of:
+
+1. a real party of **≥20 nodes** on genuine geography (not netns/`lo`), across
+   genuinely distinct failure domains;
+2. **Σ uplink ≥ 1 Gbit** across the pool (ADR-0006 critical mass; MANIFESTO §2
+   success criterion);
+3. **GLM-5.2 carved and served** (storage for the ~740 GB fp8 carve; the
+   shared-expert/DSA/MTP paths built against the real card and validated by the
+   ADR-0007 consequences checklist + ADR-0025);
+4. a **nightly churn cycle green on the day-zero dashboard** (prefix-cache hit
+   rate · batch depth · KV occupancy · per-node step p99 · perplexity canary) —
+   correlated churn survived without an operator.
+
+Until then #7 tracks the exit, and the promote-sim→real recipe (BENCH M4
+"Promote sim → real": same binaries, only addresses change) carries the M5.A +
+M5.B code forward unchanged.
