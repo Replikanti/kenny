@@ -232,7 +232,13 @@ fn make_codec(name: &str) -> Result<Box<dyn WireCodec>> {
 /// the exact `diff.rs::source_matrix` reference M0/M1 measured fp8 against. It
 /// holds every expert, so it never answers not-held (no renorm); shards are
 /// mmapped and cached across experts.
-struct SourceRefDispatch {
+///
+/// Public so the ADR-0015 verification spot-checks (`src/verify.rs`) reuse it as
+/// the recompute ORACLE: a node's answered `y` is spot-checked by recomputing the
+/// same `(layer, expert)` from the bf16 source here and comparing within tolerance
+/// (ADR-0018). Same construction the canary's own reference path uses — one
+/// bf16-source truth, two consumers.
+pub struct SourceRefDispatch {
     dir: PathBuf,
     tensor_shard: BTreeMap<String, String>,
     shards: BTreeMap<String, ShardFile>,
@@ -241,7 +247,7 @@ struct SourceRefDispatch {
 }
 
 impl SourceRefDispatch {
-    fn new(model_dir: &Path, hidden: usize, inter: usize) -> Result<SourceRefDispatch> {
+    pub fn new(model_dir: &Path, hidden: usize, inter: usize) -> Result<SourceRefDispatch> {
         let model = safetensors::open_model(model_dir)?;
         let tensor_shard = model.weight_map.into_iter().collect();
         Ok(SourceRefDispatch {

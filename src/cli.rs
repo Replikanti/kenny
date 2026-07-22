@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use crate::blob::Dtype;
-use crate::canary;
+use crate::canary::{self, SourceRefDispatch};
 use crate::carve;
 use crate::diff;
 use crate::error::{Error, Result};
@@ -16,6 +16,7 @@ use crate::placement::{HeatMap, NodeDesc, build_placement};
 use crate::prefix;
 use crate::rng::SplitMix64;
 use crate::spine::{self, Config, LocalDispatch, NodeDispatch, PlacedDispatch, Spine};
+use crate::verify::{Tolerance, VerifyingDispatch};
 use crate::wire::{Bf16Codec, Fp8Codec, WireCodec};
 
 const USAGE: &str = "\
@@ -63,7 +64,7 @@ USAGE:
                 [--tokens N] [--prompt id,id,...] [--batch N] [--codec fp8|bf16]
                 [--seed N] [--num-heads N] [--num-kv-heads N] [--head-dim N]
                 [--rope-theta N] [--rms-eps-ppm N] [--top-k N] [--layer-timeout-ms N]
-                [--replicas N] [--hedge-ms N]
+                [--replicas N] [--hedge-ms N] [--verify-frac PERMILLE]
         Run the Qwen3-30B-A3B spine-sim (ADR-0020): a pure-Rust dense forward
         whose MoE FFN is dispatched to a node (--node) or run in-process
         (--local). Reads the always-on tensors from <model_dir> by the manifest's
@@ -87,7 +88,14 @@ USAGE:
         ADR-0008 alarm at the end of the run. --hedge-ms N arms the ADR-0010
         replica-set hedge on the placed path: a stalled primary's experts spill to
         their next replica, first-answer-wins (the multi-node analogue of the
-        single-node --layer-timeout-ms; default off).
+        single-node --layer-timeout-ms; default off). --verify-frac PERMILLE arms
+        the ADR-0015 verification spot-checks on the placed path: a PERMILLE/1000
+        sample of answered dispatches is recomputed from the bf16 --model source and
+        compared to the node-returned y within a TOLERANCE envelope (ADR-0018 is
+        still proposed, so this is cosine/relative-error, NOT byte-exact), and
+        per-node trust (agree/disagree) accrues spine-locally. Multi-node only and
+        mutually exclusive with --hedge-ms (attribution is the unhedged round-0
+        primary); any distrusted node is printed at the end of the run.
 
     kenny canary --carved <fp8_dir> --model <model_dir>
                  [--prompts N] [--len N] [--seed N] [--codec fp8|bf16]
@@ -455,6 +463,7 @@ fn run_spine(args: &[String]) -> Result<()> {
     let mut layer_timeout_ms: Option<u64> = None;
     let mut replicas = 2usize; // ADR-0009 default r; clamped to the node count
     let mut hedge_ms: Option<u64> = None;
+    let mut verify_frac: Option<u64> = None; // ADR-0015 spot-check sample, in ‰
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -536,6 +545,14 @@ fn run_spine(args: &[String]) -> Result<()> {
                     1 << 30,
                 )?);
             }
+            "--verify-frac" => {
+                verify_frac = Some(parse_num(
+                    value(args, &mut i, "--verify-frac")?,
+                    "--verify-frac",
+                    1,
+                    1000,
+                )?);
+            }
             other => {
                 return Err(Error::usage(format!(
                     "spine: unexpected argument {other:?}"
@@ -602,6 +619,20 @@ fn run_spine(args: &[String]) -> Result<()> {
              single-node tail latency is --layer-timeout-ms",
         ));
     }
+    // Verification spot-checks (ADR-0015) attribute to the round-0 primary, so they
+    // are a multi-node placed knob AND incompatible with hedging (which spills to
+    // other replicas, blurring which node answered).
+    if verify_frac.is_some() && nodes.len() < 2 {
+        return Err(Error::usage(
+            "spine: --verify-frac applies to multi-node placed dispatch (2+ --node)",
+        ));
+    }
+    if verify_frac.is_some() && hedge_ms.is_some() {
+        return Err(Error::usage(
+            "spine: --verify-frac and --hedge-ms are mutually exclusive — verification \
+             attributes to the unhedged round-0 primary",
+        ));
+    }
     let mut dispatcher: Box<dyn spine::Dispatcher> = if local {
         if layer_timeout_ms.is_some() {
             return Err(Error::usage(
@@ -648,14 +679,33 @@ fn run_spine(args: &[String]) -> Result<()> {
         // --hedge-ms arms the replica-set second-send: a stalled primary's experts
         // spill to their next replica, first-answer-wins (ADR-0010 on placement).
         let hedge_delay = hedge_ms.map(std::time::Duration::from_millis);
-        Box::new(PlacedDispatch::connect(
+        let placed = PlacedDispatch::connect(
             &nodes,
             make_codec,
             identity,
             hidden,
-            map,
+            map.clone(),
             hedge_delay,
-        )?)
+        )?;
+        // --verify-frac wraps the placed dispatcher in the ADR-0015 spot-checker:
+        // a ‰ sample of answers is recomputed from the bf16 --model source (the
+        // canary's SourceRefDispatch oracle) and compared within tolerance, per-node
+        // trust accruing spine-locally. The wrap is transparent — the generated
+        // tokens are identical to the bare placed run (verification is a side-channel).
+        if let Some(permille) = verify_frac {
+            let inter = manifest.model.inter as usize;
+            let oracle = SourceRefDispatch::new(&model, hidden, inter)?;
+            Box::new(VerifyingDispatch::new(
+                placed,
+                Box::new(oracle),
+                map,
+                permille,
+                seed,
+                Tolerance::default(),
+            ))
+        } else {
+            Box::new(placed)
+        }
     };
 
     let (outs, stats) = spine.generate_batch(dispatcher.as_mut(), &prompt_refs, tokens)?;
@@ -739,6 +789,40 @@ fn run_spine(args: &[String]) -> Result<()> {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
+    }
+    // ADR-0015 verification: the per-node trust tally and the distrust verdict, if
+    // --verify-frac armed the spot-checks (tolerance-based; ADR-0018 exact-compare
+    // still deferred). A node distrusted at ≥ 50 % disagreement over ≥ 1 check is
+    // flagged — the byzantine (wrong-answer) analogue of the dead-replica alarm.
+    if let Some(trust) = dispatcher.trust() {
+        let (mut checks, mut disagreements) = (0u64, 0u64);
+        for (_, c) in trust.iter() {
+            checks += c.checks;
+            disagreements += c.disagreements;
+        }
+        println!(
+            "verify:   {} spot-checks (frac {}‰), {} disagreements, tolerance-based (ADR-0015 / ADR-0018)",
+            checks,
+            verify_frac.unwrap_or(0),
+            disagreements
+        );
+        let distrusted = trust.distrusted(1, 1, 2);
+        if distrusted.is_empty() {
+            println!("trust:    all spot-checked nodes within tolerance");
+        } else {
+            println!(
+                "distrust: {} node(s) over 50% disagreement (ADR-0015): {}",
+                distrusted.len(),
+                distrusted
+                    .iter()
+                    .map(|&n| {
+                        let c = trust.get(n);
+                        format!("{} ({}/{})", nodes[n], c.disagreements, c.checks)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
     }
     Ok(())
 }

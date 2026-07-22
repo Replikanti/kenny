@@ -807,3 +807,72 @@ KENNY_NETEM_CHURN_DOMAIN_SIZE=2 bash tools/netem-bench.sh --nodes 6 --churn
 KENNY_MODEL_DIR=<model_dir> cargo test --release --test dispatch \
     renorm_quality_dip_real_model -- --nocapture
 ```
+
+## M5.B — verification spot-checks (ADR-0015, tolerance-based) (2026-07-22)
+
+The trusted-pool integrity retrofit ADR-0015 designed for: the spine samples a `‰`
+fraction of a placed pool's answers, recomputes each sampled `(layer, expert)` from the
+bf16 SOURCE (the canary's `SourceRefDispatch` oracle / `diff.rs::source_matrix`), and
+compares within a **tolerance envelope** (cosine ≥ 0.99 AND relative-L2 ≤ 0.25),
+accumulating a spine-local per-node trust tally. Comparison is tolerance-based, NOT
+byte-exact: ADR-0018 is still `proposed` (fp8 FMA reordering + the node seeing the
+codec-rounded activation while the oracle sees raw f32), so an exact byte-compare lane is
+blocked on ADR-0018's int8 arm. Nothing on the wire moved — `VerifyingDispatch` is a
+transparent decorator (`WIRE_VERSION` = 1, every codec version 1, all five wire goldens
+byte-identical, ADR-0024).
+
+### Honest vs byzantine — real-model anchor (Qwen3-30B-A3B, fp8, 2 placed nodes)
+
+Two fp8 nodes (`r = 1`, uniform placement), one short batched generation each (2 streams ×
+2 prompt + 2 generated tokens), 5 ‰ sampling. Measured 2026-07-22:
+
+| arm       | node 1     | spot-checks | disagreements | distrusted | wall  |
+|-----------|------------|------------:|--------------:|-----------:|------:|
+| honest    | fp8 (real) | 14          | 0             | none       | 43.4 s |
+| byzantine | garbage    | 14          | 8             | node 1     | 23.7 s |
+
+The HONEST arm is the load-bearing number: the real fp8 numeric path stays INSIDE the
+tolerance envelope, so verification raises ZERO false distrust — the property ADR-0018's
+tolerance-based choice rests on. The BYZANTINE arm confirms a garbage node is caught on
+real dimensions: node 1 holds ~half the catalog at `r = 1`, so ~half the 14 sampled
+answers (8) are its garbage and it is distrusted, while node 0 stays clean. Sample counts
+match because the sampling RNG is seeded identically across the two runs.
+
+### Model-free CI locks
+
+`tests/dispatch.rs::{spot_check_passes_honest_within_tolerance, spot_check_catches_lying_node,
+trust_tally_is_deterministic}` (fixture bf16 source oracle, no netns, no model) — an honest
+pool raises no distrust, a byzantine node is caught, and the trust tally is reproducible per
+seed. `src/verify.rs` unit tests lock the `TrustTally` distrust math, the tolerance envelope
+(admits fp8-close, rejects direction AND scale lies), and the decorator's output transparency.
+HONEST FIXTURE NOTE (ADR-0007): the fixture honest lock uses the **bf16** codec — its only
+departure from the oracle is the bf16 rounding of the input activation, a genuine
+tolerance-level difference; fp8 on RANDOM fixture weights is a pathologically amplified
+quantization worst case (unrepresentative of the real card's ~1e-3 per-expert error), so
+fp8-within-tolerance is asserted on the real model, not the fixture.
+
+### Deferred — exact byte-compare + stake (ADR-0018 int8 arm / real party, #7)
+
+The exact byte-compare lane needs ADR-0018's `Int8Codec` (bit-exact cross-architecture
+accumulation) — a labeled follow-up, not this PR. Trust weighting is agreement-count only;
+stake-based trust and a real ≥20-node adversarial party stay M5.C / #7. Until then pool
+membership is a social boundary and spot-checks are a deterrent + integrity signal, not an
+adversarial-safety guarantee.
+
+### Reproduce
+
+```
+# Model-free CI locks (no netns, no model) — plain cargo test:
+cargo test --test dispatch spot_check_passes_honest_within_tolerance
+cargo test --test dispatch spot_check_catches_lying_node
+cargo test --test dispatch trust_tally_is_deterministic
+cargo test --lib verify::
+
+# Real-model honest/byzantine anchor (the table above):
+KENNY_MODEL_DIR=<model_dir> cargo test --release --test dispatch \
+    verification_spot_check_real_model -- --nocapture
+
+# CLI: arm spot-checks on a multi-node placed run (‰ sample of answers):
+kenny spine --carved <fp8_dir> --model <model_dir> \
+    --node <a> --node <b> --verify-frac 100
+```

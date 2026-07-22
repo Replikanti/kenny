@@ -396,6 +396,15 @@ pub trait Dispatcher {
     fn suspect_replicas(&self) -> Vec<(u16, u16)> {
         Vec::new()
     }
+
+    /// Spine-local per-node verification trust (ADR-0015) accumulated over this
+    /// dispatcher's life, if it spot-checks answers (a [`crate::verify::VerifyingDispatch`]
+    /// wrap). `None` for every dispatcher without verification — read at the end
+    /// of a run like [`Self::suspect_replicas`], the mirror of the dead-replica
+    /// alarm for byzantine (wrong-answer) rather than dead (no-answer) nodes.
+    fn trust(&self) -> Option<&crate::verify::TrustTally> {
+        None
+    }
 }
 
 /// In-process dispatch: runs experts through a `Node` loaded from the carve,
