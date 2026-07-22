@@ -908,3 +908,180 @@ fn batch_sweep_localhost() {
         );
     }
 }
+
+// -------------------------------------------------------------------------
+// M3 — tc netem simulated WAN amortization (issue #5). netns-gated exactly like
+// the KENNY_MODEL_DIR real-model arms: skip unless `KENNY_NETEM_RTT_MS` is set,
+// so a plain `cargo test --test dispatch` in CI never touches netem. The
+// namespace + `tc netem` qdisc are installed by `tools/netem-bench.sh`; this test
+// only measures inside them — netem on `lo` delays the loopback TCP between the
+// spine's main thread and the node's background thread, so `via_node_batch` runs
+// unchanged under emulated RTT (no OS-process split, no root, no new transport).
+//
+// It emits BENCH numbers (tok/s, per-step median/p99, t_step), NOT pass/fail —
+// mirroring `batch_sweep_localhost` — and re-asserts the ADR-0023 per-direction
+// wire reconciliation so batching is re-proven to add no new wire shape under RTT.
+// -------------------------------------------------------------------------
+
+#[test]
+fn netem_amortization() {
+    let Some(rtt_os) = std::env::var_os("KENNY_NETEM_RTT_MS") else {
+        eprintln!(
+            "KENNY_NETEM_RTT_MS unset — skipping M3 netem amortization \
+             (run via tools/netem-bench.sh)"
+        );
+        return;
+    };
+    let rtt_ms: u64 = rtt_os
+        .to_string_lossy()
+        .parse()
+        .expect("KENNY_NETEM_RTT_MS must be an integer number of milliseconds");
+    // Predicted per-step RTT floor: 48 MoE barriers × RTT (MANIFESTO §4.4). Qwen3
+    // has 48 MoE layers and the fixture below is shaped to match, so the same
+    // multiplier applies to both arms.
+    let predicted_floor_ms = 48u64 * rtt_ms;
+
+    match std::env::var_os("KENNY_MODEL_DIR") {
+        Some(dir) => netem_real_model_anchor(&PathBuf::from(dir), rtt_ms, predicted_floor_ms),
+        None => netem_fixture_amortization(rtt_ms, predicted_floor_ms),
+    }
+}
+
+/// Fixture arm (model-free): a 48-layer synthetic model (compute≈0 at hidden 8 /
+/// inter 4) makes the per-layer RTT barrier the whole per-step signal and gives a
+/// populated p99 tail cheaply. Reports aggregate tok/s + per-step median/p99 as B
+/// rises — the ∝B amortization slope that a flat RTT≈0 loopback line (M2) cannot
+/// show. G3: `tok/s(B=64) / tok/s(B=1) ≥ 16×`.
+fn netem_fixture_amortization(rtt_ms: u64, predicted_floor_ms: u64) {
+    let root = tmp("netem-fixture");
+    // 48 MoE barriers ≡ Qwen3-30B-A3B; hidden 8 / inter 4 keeps compute negligible.
+    let params = Params {
+        layers: 48,
+        experts: 8,
+        hidden: 8,
+        inter: 4,
+        vocab: 32,
+        seed: 42,
+    };
+    let model = root.join("model");
+    fixture::generate(&params, &model).unwrap();
+    let carved = root.join("carved");
+    carve::run(
+        &model,
+        &Options {
+            out: carved.clone(),
+            model_name: "netem-fixture".into(),
+            model_rev: String::new(),
+            dtype: Dtype::Fp8,
+        },
+    )
+    .unwrap();
+
+    let manifest = Manifest::load(&carved.join(manifest::FILE_NAME)).unwrap();
+    let hidden = manifest.model.hidden as usize;
+    let moe_layers = manifest.model.moe_layers as u64;
+    let spine = Spine::load(&model, &manifest, config(hidden, 2)).unwrap();
+
+    let prompt_len = 2usize;
+    // ~100 batched steps (max_new) → 101 per-step samples for a real p99 tail.
+    // NOTE: per-point wall time is ~steps × step_median. That is RTT-floor-bounded
+    // (~steps × 48·RTT, ≈ const in B) ONLY when the composed-wire batch actually
+    // pipelines the B per-layer round-trips under RTT. On a transport that lets
+    // Nagle serialize the per-stream frames (no TCP_NODELAY — the measured M3
+    // finding), step time grows ∝ B and the large-B points take proportionally
+    // longer; the compute≈0 fixture makes that transport behaviour the whole signal.
+    let steps = 100usize;
+    let vocab = spine.vocab();
+    let k = spine.experts_per_step() as u64;
+    let payload = hidden as u64; // fp8: one byte per element
+    let forwards = (prompt_len + steps - 1) as u64;
+
+    eprintln!(
+        "M3 fixture amortization: {moe_layers} MoE layers, RTT {rtt_ms} ms, \
+         predicted floor {predicted_floor_ms} ms/step, {steps} steps, fp8 wire, netem loopback"
+    );
+    eprintln!("B\ttok/s\tstep_median\tstep_p99\tup_B\tdown_B");
+    for b in [1usize, 4, 16, 64] {
+        let prompts = bench_prompts(b, prompt_len, vocab, 42);
+        let refs: Vec<&[u32]> = prompts.iter().map(Vec::as_slice).collect();
+        let (_outs, stats) = via_node_batch(&spine, &carved, "fp8", &refs, steps, &[]);
+
+        // ADR-0023 wire reconciliation: batching adds no new wire shape under RTT.
+        let d = b as u64 * forwards * moe_layers;
+        let up = HANDSHAKE_LEN as u64 + d * (DISPATCH_HEADER_LEN as u64 + payload + 2 * k);
+        let down =
+            d * (GATHER_HEADER_LEN as u64 + GATHER_RECORD_HEADER_LEN as u64 * k + payload * k);
+        assert_eq!(stats.wire_up, up, "B={b}: up bytes reconcile to framing");
+        assert_eq!(
+            stats.wire_down, down,
+            "B={b}: down bytes reconcile to framing"
+        );
+        assert_eq!(stats.dispatches, d, "B={b}: dispatch count under netem");
+
+        let secs = stats.elapsed.as_secs_f64();
+        let tok_s = stats.generated_tokens as f64 / secs;
+        let (median, p99) = stats.latency_median_p99();
+        eprintln!(
+            "{b}\t{tok_s:.3}\t{median:.2?}\t{p99:.2?}\t{}\t{}",
+            stats.wire_up, stats.wire_down
+        );
+    }
+}
+
+/// Real-model anchor (KENNY_MODEL_DIR): the M2 harness at B∈{1,8}, prompt_len 2,
+/// max_new 1 (→ 2 priming forwards), reporting `t_step` at real payload/compute
+/// scale. The wrapper drives this at RTT 0 (control) then RTT ms in the same
+/// netns so BENCH can report `Δt_step = t_step(RTT) − t_step(0)` against the
+/// predicted `48·RTT` floor (G1/G2). B≥16 is excluded on purpose: there the RTT
+/// penalty is <1% of `t_step` and drowned by CPU-scheduling noise.
+fn netem_real_model_anchor(model_dir: &Path, rtt_ms: u64, predicted_floor_ms: u64) {
+    // fp8 carve of the real model (shared with S7/M2; re-runs dedup-skip).
+    let carved = Path::new(env!("CARGO_TARGET_TMPDIR")).join("real-carve-fp8");
+    std::fs::create_dir_all(&carved).unwrap();
+    let t0 = std::time::Instant::now();
+    let s = carve::run(
+        model_dir,
+        &Options {
+            out: carved.clone(),
+            model_name: "qwen3-30b-a3b".into(),
+            model_rev: String::new(),
+            dtype: Dtype::Fp8,
+        },
+    )
+    .unwrap();
+    eprintln!(
+        "M3 fp8 carve: {} blobs ({} dedup) in {:.1?}",
+        s.blobs,
+        s.dedup_skipped,
+        t0.elapsed()
+    );
+
+    let manifest = Manifest::load(&carved.join(manifest::FILE_NAME)).unwrap();
+    let moe_layers = manifest.model.moe_layers as u64;
+    let t_load = std::time::Instant::now();
+    let spine = Spine::load(model_dir, &manifest, Config::default()).unwrap();
+    eprintln!(
+        "M3 spine load (always-on tensors): {:.1?}",
+        t_load.elapsed()
+    );
+
+    let prompt_len = 2usize;
+    let max_new = 1usize; // forwards = prompt_len = 2 priming steps → t_step
+    let vocab = spine.vocab();
+
+    eprintln!(
+        "M3 real-model anchor: {moe_layers} MoE layers, RTT {rtt_ms} ms, \
+         predicted floor {predicted_floor_ms} ms, fp8 wire, netem loopback"
+    );
+    eprintln!("B\tt_step_median\tt_step_p99\tup_B\tdown_B");
+    for b in [1usize, 8] {
+        let prompts = bench_prompts(b, prompt_len, vocab, 42);
+        let refs: Vec<&[u32]> = prompts.iter().map(Vec::as_slice).collect();
+        let (_outs, stats) = via_node_batch(&spine, &carved, "fp8", &refs, max_new, &[]);
+        let (median, p99) = stats.latency_median_p99();
+        eprintln!(
+            "{b}\t{median:.3?}\t{p99:.3?}\t{}\t{}",
+            stats.wire_up, stats.wire_down
+        );
+    }
+}
