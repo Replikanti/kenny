@@ -2103,6 +2103,258 @@ fn renorm_quality_dip_grows_with_dropout() {
     );
 }
 
+// -------------------------------------------------------------------------
+// M5.B — verification spot-checks (ADR-0015, tolerance-based per ADR-0018).
+// A sampled fraction of a placed pool's answers is recomputed from the bf16
+// SOURCE (the canary's SourceRefDispatch oracle) and compared within a cosine +
+// relative-error envelope; per-node trust (agree/disagree) accrues spine-locally.
+// All model-free (the fixture bf16 source is the oracle); the real-model arm is
+// KENNY_MODEL_DIR-gated below. NOTHING on the wire moves — VerifyingDispatch is a
+// transparent decorator (WIRE_VERSION 1, five goldens frozen, ADR-0024).
+// -------------------------------------------------------------------------
+
+use kenny::canary::SourceRefDispatch;
+use kenny::verify::{Tolerance, TrustTally, VerifyingDispatch};
+use kenny::wire::{ExpertStatus, Gather, GatherResult, Transport, codec_for};
+
+/// Spawn a BYZANTINE node: correct framing, WRONG numbers. It handshakes (ignoring
+/// the manifest identity — a test-only fake peer), then answers every held `(layer,
+/// expert)` with a constant garbage `y` of the right length and `NotHeld` for the
+/// rest. This is the wrong-answer peer ADR-0015 spot-checks exist to catch (a
+/// bit-rotted blob or a malicious node), distinct from a DEAD node (which the
+/// ADR-0008 alarm catches). Serves in a loop like `spawn_subset_node`.
+fn spawn_lying_subset_node_at(
+    keep: HashSet<(u16, u16)>,
+    hidden: usize,
+    done: Arc<AtomicBool>,
+    bind: &str,
+) -> (SocketAddr, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind(bind).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = thread::spawn(move || {
+        for stream in listener.incoming() {
+            let sock = match stream {
+                Ok(s) => s,
+                Err(_) => break,
+            };
+            if done.load(Ordering::SeqCst) {
+                break;
+            }
+            sock.set_nodelay(true).unwrap();
+            let mut t = Transport::new(sock);
+            let hs = match t.recv_handshake() {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
+            let codec = codec_for(hs.codec_id, hs.codec_version).unwrap();
+            let elem = codec.elem_bytes();
+            let expect_x_len = hidden * elem;
+            let y_len = (hidden * elem) as u32;
+            // A garbage y (constant 42.0), well-formed under the negotiated codec.
+            let mut garbage = Vec::new();
+            codec.encode(&vec![42.0f32; hidden], &mut garbage);
+            while let Ok(dispatch) = t.recv_dispatch(expect_x_len) {
+                let results: Vec<GatherResult> = dispatch
+                    .experts
+                    .iter()
+                    .map(|&e| {
+                        if keep.contains(&(dispatch.layer, e)) {
+                            GatherResult {
+                                expert: e,
+                                status: ExpertStatus::Ok,
+                                y: garbage.clone(),
+                            }
+                        } else {
+                            GatherResult {
+                                expert: e,
+                                status: ExpertStatus::NotHeld,
+                                y: Vec::new(),
+                            }
+                        }
+                    })
+                    .collect();
+                if t.send_gather(&Gather {
+                    layer: dispatch.layer,
+                    y_len,
+                    results,
+                })
+                .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    });
+    (addr, handle)
+}
+
+/// Stand up an `r = 1` placed pool of `node_count` uniform nodes over the fixture
+/// carve — node `lying` (if any) is BYZANTINE (garbage answers), every other node
+/// honest — wrap it in `VerifyingDispatch` against the bf16-source oracle, run a
+/// short batched generation, and return the accumulated trust plus spot-check
+/// totals. `r = 1` gives every expert exactly one primary, so attribution is
+/// unambiguous.
+fn verified_run(
+    model: &Path,
+    carved: &Path,
+    which: &str,
+    node_count: usize,
+    lying: Option<usize>,
+    permille: u64,
+    seed: u64,
+) -> (TrustTally, u64, u64) {
+    let manifest = Manifest::load(&carved.join(manifest::FILE_NAME)).unwrap();
+    let identity = *blake3::hash(&manifest.canonical_bytes()).as_bytes();
+    let hidden = manifest.model.hidden as usize;
+    let inter = manifest.model.inter as usize;
+    let spine = Spine::load(model, &manifest, config(hidden, 2)).unwrap();
+    let all = all_expert_keys(&manifest);
+    let nodes = uniform_nodes(node_count);
+    let map = build_placement(&nodes, &bootstrap_heat(&all, &[]), 1).unwrap();
+    for j in 0..node_count {
+        assert!(!map.subset_for(j).is_empty(), "node {j} must hold a shard");
+    }
+
+    let mut addrs = Vec::with_capacity(node_count);
+    let mut dones = Vec::with_capacity(node_count);
+    let mut handles = Vec::with_capacity(node_count);
+    for j in 0..node_count {
+        let done = Arc::new(AtomicBool::new(false));
+        let keep: HashSet<(u16, u16)> = map.subset_for(j).into_iter().collect();
+        let (addr, handle) = if Some(j) == lying {
+            spawn_lying_subset_node_at(keep, hidden, done.clone(), "127.0.0.1:0")
+        } else {
+            spawn_subset_node(carved, &all, keep, done.clone())
+        };
+        addrs.push(addr.to_string());
+        dones.push(done);
+        handles.push(handle);
+    }
+
+    let placed = PlacedDispatch::connect(
+        &addrs,
+        || make_codec(which),
+        identity,
+        hidden,
+        map.clone(),
+        None,
+    )
+    .unwrap();
+    let oracle = SourceRefDispatch::new(model, hidden, inter).unwrap();
+    let mut vd = VerifyingDispatch::new(
+        placed,
+        Box::new(oracle),
+        map,
+        permille,
+        seed,
+        Tolerance::default(),
+    );
+
+    let prompts: Vec<&[u32]> = vec![&[1, 2, 3], &[3, 2, 1]];
+    let _ = spine.generate_batch(&mut vd, &prompts, 3).unwrap();
+    let out = (vd.trust().clone(), vd.spot_checks(), vd.disagreements());
+    drop(vd);
+    shutdown_pool(&dones, &addrs, handles);
+    out
+}
+
+/// CI LOCK: an honest pool passes verification — every spot-check is within the
+/// tolerance envelope (ADR-0018: the node computes on the codec-rounded activation
+/// while the oracle sees raw f32, so this is tolerance-close, NOT byte-exact), so
+/// no node is distrusted and there are zero disagreements. Checks the whole sample
+/// (`1000‰`) so the assertion is over every answered expert.
+///
+/// bf16 is the honest codec here: the node's only departure from the bf16-source
+/// oracle is the bf16 ROUNDING of the input activation, a genuine tolerance-level
+/// (not byte-exact) difference the envelope admits. fp8's per-expert error is left
+/// to the real-model arm (`verification_spot_check_real_model`): on the real card
+/// fp8 is tolerance-close (M0 per-expert 1−cos ≈ 1e-3), but on RANDOM fixture
+/// weights fp8 quantization is pathologically amplified (an unrepresentative
+/// worst case), so asserting fp8-passes there would test the fixture, not the
+/// mechanism.
+#[test]
+fn spot_check_passes_honest_within_tolerance() {
+    let root = tmp("verify-honest");
+    let (model, carved) = fixture_and_carve(&root);
+    let (trust, checks, disagreements) = verified_run(&model, &carved, "bf16", 3, None, 1000, 7);
+    assert!(checks > 0, "the honest run must spot-check answers");
+    assert_eq!(
+        disagreements, 0,
+        "an honest pool has no disagreements (tolerance-based)"
+    );
+    assert!(
+        trust.distrusted(1, 1, 2).is_empty(),
+        "no honest node is distrusted"
+    );
+    for (node, c) in trust.iter() {
+        assert_eq!(
+            c.disagreements, 0,
+            "honest node {node} disagrees on nothing"
+        );
+        assert_eq!(c.checks, c.agreements, "all checks agree");
+    }
+}
+
+/// CI LOCK: a single byzantine node returning garbage is CAUGHT — every spot-check
+/// of its answers falls outside the tolerance envelope, so it is distrusted while
+/// every honest node stays clean. `r = 1` places each expert on exactly one node,
+/// so the lying node's experts are attributed to it unambiguously.
+#[test]
+fn spot_check_catches_lying_node() {
+    let root = tmp("verify-liar");
+    let (model, carved) = fixture_and_carve(&root);
+    let lying_idx = 1usize;
+    let (trust, checks, disagreements) =
+        verified_run(&model, &carved, "bf16", 3, Some(lying_idx), 1000, 7);
+
+    assert!(checks > 0, "the run must spot-check answers");
+    assert!(
+        disagreements > 0,
+        "the byzantine node's garbage must be caught"
+    );
+    assert_eq!(
+        trust.distrusted(1, 1, 2),
+        vec![lying_idx],
+        "exactly the lying node is distrusted"
+    );
+    let liar = trust.get(lying_idx);
+    assert!(
+        liar.checks > 0 && liar.agreements == 0,
+        "the liar never agrees"
+    );
+    // Every honest node stays clean.
+    for (node, c) in trust.iter() {
+        if node != lying_idx {
+            assert_eq!(
+                c.disagreements, 0,
+                "honest node {node} must not be flagged (garbage confined to the liar)"
+            );
+        }
+    }
+}
+
+/// CI LOCK: the trust tally is deterministic — same pool, same seed, same sample
+/// fraction ⇒ identical per-node agree/disagree counts. Uses a partial fraction
+/// (`500‰`) so the SAMPLING determinism is locked too, not just the comparison.
+#[test]
+fn trust_tally_is_deterministic() {
+    let root = tmp("verify-determinism");
+    let (model, carved) = fixture_and_carve(&root);
+    let snapshot = || {
+        let (trust, checks, dis) = verified_run(&model, &carved, "bf16", 3, Some(2), 500, 99);
+        let per_node: Vec<(usize, u64, u64, u64)> = trust
+            .iter()
+            .map(|(n, c)| (n, c.checks, c.agreements, c.disagreements))
+            .collect();
+        (per_node, checks, dis)
+    };
+    let a = snapshot();
+    let b = snapshot();
+    assert_eq!(a, b, "the trust tally is reproducible per seed");
+    // A partial fraction really samples a subset, not every answer.
+    assert!(a.1 > 0, "some answers were spot-checked");
+}
+
 /// REGRESSION LOCK: the replica-set hedge with NO loss is bit-for-bit the local
 /// path and NEVER fires. `r = 2` over two nodes replicates every expert on both;
 /// the primary (round 0) answers every layer within a generous hedge delay, so
@@ -2782,6 +3034,122 @@ fn renorm_quality_dip_real_model() {
             "perplexity must be finite positive"
         );
     }
+}
+
+// -------------------------------------------------------------------------
+// M5.B — verification spot-checks against the REAL Qwen3-30B-A3B
+// (KENNY_MODEL_DIR). A 2-node fp8 placed pool is spot-checked against the bf16
+// SOURCE oracle: the HONEST arm proves the real fp8 numeric path stays inside the
+// tolerance envelope (no false-positive distrust — the number ADR-0018's
+// tolerance-based choice rests on), and a BYZANTINE arm confirms a garbage node is
+// caught on real dimensions. Budget-capped (small batch + a low sample fraction, so
+// the oracle recompute is a fraction of answers). Gated — CI never downloads a model.
+// -------------------------------------------------------------------------
+#[test]
+fn verification_spot_check_real_model() {
+    let Some(dir) = std::env::var_os("KENNY_MODEL_DIR") else {
+        eprintln!("KENNY_MODEL_DIR unset — skipping M5.B real-model verification spot-check");
+        return;
+    };
+    let model_dir = PathBuf::from(dir);
+    let carved = Path::new(env!("CARGO_TARGET_TMPDIR")).join("real-carve-fp8");
+    std::fs::create_dir_all(&carved).unwrap();
+    carve::run(
+        &model_dir,
+        &Options {
+            out: carved.clone(),
+            model_name: "qwen3-30b-a3b".into(),
+            model_rev: String::new(),
+            dtype: Dtype::Fp8,
+        },
+    )
+    .unwrap();
+    let manifest = Manifest::load(&carved.join(manifest::FILE_NAME)).unwrap();
+    let identity = *blake3::hash(&manifest.canonical_bytes()).as_bytes();
+    let hidden = manifest.model.hidden as usize;
+    let inter = manifest.model.inter as usize;
+    let spine = Spine::load(&model_dir, &manifest, Config::default()).unwrap();
+    let all = all_expert_keys(&manifest);
+    let nodes = uniform_nodes(2);
+    let map = build_placement(&nodes, &bootstrap_heat(&all, &[]), 1).unwrap();
+
+    // A short teacher-free batched generation (budget cap): 2 streams × 2 prompt
+    // tokens, 2 generated. 5 ‰ sampling keeps the oracle recompute a small fraction.
+    let permille = 5u64;
+    let run = |lying: Option<usize>| -> (TrustTally, u64, u64, std::time::Duration) {
+        let mut addrs = Vec::new();
+        let mut dones = Vec::new();
+        let mut handles = Vec::new();
+        for j in 0..2usize {
+            let done = Arc::new(AtomicBool::new(false));
+            let keep: HashSet<(u16, u16)> = map.subset_for(j).into_iter().collect();
+            let (addr, handle) = if Some(j) == lying {
+                spawn_lying_subset_node_at(keep, hidden, done.clone(), "127.0.0.1:0")
+            } else {
+                spawn_subset_node(&carved, &all, keep, done.clone())
+            };
+            addrs.push(addr.to_string());
+            dones.push(done);
+            handles.push(handle);
+        }
+        let placed = PlacedDispatch::connect(
+            &addrs,
+            || make_codec("fp8"),
+            identity,
+            hidden,
+            map.clone(),
+            None,
+        )
+        .unwrap();
+        let oracle = SourceRefDispatch::new(&model_dir, hidden, inter).unwrap();
+        let mut vd = VerifyingDispatch::new(
+            placed,
+            Box::new(oracle),
+            map.clone(),
+            permille,
+            42,
+            Tolerance::default(),
+        );
+        let prompts: Vec<&[u32]> = vec![&[1, 2], &[3, 4]];
+        let t0 = std::time::Instant::now();
+        let _ = spine.generate_batch(&mut vd, &prompts, 2).unwrap();
+        let el = t0.elapsed();
+        let out = (vd.trust().clone(), vd.spot_checks(), vd.disagreements(), el);
+        drop(vd);
+        shutdown_pool(&dones, &addrs, handles);
+        out
+    };
+
+    // HONEST: the real fp8 path must stay inside the tolerance envelope.
+    let (htrust, hchecks, hdis, hel) = run(None);
+    eprintln!(
+        "M5.B real verification HONEST (fp8, 2 nodes, {permille}‰): {hchecks} spot-checks, \
+         {hdis} disagreements in {hel:.1?}; distrusted={:?}",
+        htrust.distrusted(1, 1, 2)
+    );
+    assert!(hchecks > 0, "the honest run must spot-check answers");
+    assert_eq!(
+        hdis, 0,
+        "the real fp8 numeric path must stay within tolerance (no false distrust)"
+    );
+    assert!(
+        htrust.distrusted(1, 1, 2).is_empty(),
+        "no honest node distrusted on the real card"
+    );
+
+    // BYZANTINE: node 1 garbage must be caught on real dimensions.
+    let (btrust, bchecks, bdis, bel) = run(Some(1));
+    eprintln!(
+        "M5.B real verification BYZANTINE (node 1 garbage): {bchecks} spot-checks, {bdis} \
+         disagreements in {bel:.1?}; distrusted={:?}",
+        btrust.distrusted(1, 1, 2)
+    );
+    assert!(bdis > 0, "the byzantine node must be caught");
+    assert_eq!(
+        btrust.distrusted(1, 1, 2),
+        vec![1],
+        "exactly the lying node is distrusted on the real card"
+    );
 }
 
 // -------------------------------------------------------------------------
