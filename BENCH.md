@@ -39,8 +39,9 @@ int8 `eb489bca…` — dtype is part of the model identity (ADR-0012).
 
 First ADR-0018 signal: at identical blob size, int8 per-channel carries ~8×
 less cosine error than fp8 e4m3 per-channel on these weights (1−cos:
-1.0e-3 vs 1.3e-4). The wire-path decision still waits for M3's end-to-end
-numbers (perplexity canaries + throughput), as ADR-0018 specifies.
+1.0e-3 vs 1.3e-4). At M3, the throughput axis settled as a non-discriminator
+(equal bytes/element); the deciding quality axis stays blocked on the ADR-0008
+perplexity canary (ADR-0018, amended).
 
 ### Reproduce
 
