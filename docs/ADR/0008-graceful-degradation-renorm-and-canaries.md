@@ -72,10 +72,15 @@ churn shows up as a smooth quality dip, not an outage" requires:
   dropout: as the fraction of experts forced not-held GROWS, the renormed output
   diverges monotonically from the full-coverage answer (scored through the canary's
   own `Spine::logits_per_position`) and returns EXACTLY to baseline when coverage
-  is restored. HONEST CAVEAT (ADR-0007): on random fixture weights the canary NLL
-  drifts toward the ln(vocab) floor rather than strictly worsening, so the SIGN of
-  a real perplexity dip is the `KENNY_MODEL_DIR` arm (`renorm_quality_dip_real_model`,
-  BENCH "M5.A — elasticity").
+  is restored. HONEST CAVEAT (ADR-0007): the canary NLL drifts toward the ln(vocab)
+  floor under dropout rather than strictly worsening — and the `KENNY_MODEL_DIR`
+  arm (`renorm_quality_dip_real_model`, BENCH "M5.A — elasticity") shows the REAL
+  Qwen3-30B-A3B doing the SAME on random canary prompts (perplexity 1.1e7 → 4.0e6
+  as experts drop), because kenny has no tokenizer yet: random next-tokens carry no
+  signal for an expert to preserve. The SIGN of a real quality dip needs real TEXT
+  prompts (deferred); the robust model-free signal is the divergence-from-full
+  metric, and the real card confirms only that the renorm path stays finite and
+  deterministic under heavy dropout.
 
 The shaped-uplink netns SIMULATION (`netem_churn`, `tools/netem-bench.sh --churn`)
 additionally surfaces a real ADR-0010 × ADR-0008 interaction: a replica-set budget

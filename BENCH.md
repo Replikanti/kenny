@@ -727,20 +727,32 @@ dip returns to exactly the baseline when coverage is restored (re-replication).
 
 HONEST FIXTURE CAVEAT (ADR-0007): on RANDOM fixture weights the literal canary NLL
 drifts toward the ln(vocab) uniform-prior floor under dropout (3.4698 → 3.4671 over
-the same ladder) rather than strictly worsening, so the SIGN/curve of a real
-perplexity dip is only measurable on the real card — the `renorm_quality_dip_real_model`
-arm below. What the fixture locks model-free is the divergence-from-full signal
-being monotone in the down-fraction and cleanly recoverable.
+the same ladder) rather than strictly worsening. What the fixture locks model-free
+is the divergence-from-full signal being monotone in the down-fraction and cleanly
+recoverable — a proxy for "the output moved", NOT the direction of a quality change.
 
 ### Renorm quality dip under dropout — real-model anchor (Qwen3-30B-A3B, fp8)
 
-Teacher-forced perplexity of the fp8 path as a growing fraction of experts is
-forced not-held across every MoE layer (2 sequences × 8 tokens, budget-capped). The
-number is the deliverable; see Reproduce.
+Teacher-forced perplexity of the fp8 path as a growing fraction of experts is forced
+not-held across every MoE layer (2 sequences × 8 tokens, budget-capped; carve + run
+≈ 8.5 min on this host). Measured 2026-07-22:
 
-| down-fraction | dropped/layer | perplexity | Δppl vs full |
-|--------------:|--------------:|-----------:|-------------:|
-| _pending gated run — `renorm_quality_dip_real_model`_ ||||
+| down-fraction | dropped/layer | perplexity   | Δppl vs full  |
+|--------------:|--------------:|-------------:|--------------:|
+| 0.000         | 0             | 11 008 857.6 | +0.0          |
+| 0.125         | 16            |  7 714 230.6 | −3 294 627.0  |
+| 0.250         | 32            |  4 018 279.7 | −6 990 577.9  |
+
+HONEST RESULT — the real model on RANDOM canary prompts shows perplexity DROPPING
+under dropout, the SAME uniform-prior drift the fixture NLL shows, and for the same
+reason: kenny has no tokenizer yet (ADR-0007), so the prompts are random in-vocab
+tokens that carry no signal for an expert to preserve — a confidently-wrong full
+model (ppl ≈ 1.1e7) moving toward uniform under dropout LOWERS its perplexity. The
+absolute magnitude is itself the tell: these are not text perplexities. The SIGN of
+a real quality dip therefore needs real TEXT prompts (a tokenizer), which is
+deferred; until then the divergence-from-full-coverage metric above is the honest
+model-free signal, and the real card confirms only that the fp8 renorm path stays
+finite and deterministic under heavy dropout.
 
 ### Correlated-churn down-window — netns SIMULATION (4 shaped nodes)
 

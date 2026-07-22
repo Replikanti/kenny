@@ -1951,12 +1951,15 @@ fn churn_flags_dead_replicas() {
 /// (`canary::teacher_forced_nll`) is reported alongside to show it registers the
 /// dip deterministically.
 ///
-/// HONEST FIXTURE CAVEAT (ADR-0007): on RANDOM fixture weights the canary NLL
-/// drifts toward the ln(vocab) uniform-prior floor under dropout rather than
-/// strictly worsening, so the SIGN/curve of a real perplexity dip is only
-/// measurable on the real card — the `renorm_quality_dip_real_model`
-/// (`KENNY_MODEL_DIR`) arm. What holds model-free is the divergence-from-full
-/// signal being monotone in the down-fraction and cleanly recoverable.
+/// HONEST FIXTURE CAVEAT (ADR-0007): the canary NLL drifts toward the ln(vocab)
+/// uniform-prior floor under dropout rather than strictly worsening — and the
+/// `renorm_quality_dip_real_model` (`KENNY_MODEL_DIR`) arm shows the REAL
+/// Qwen3-30B-A3B doing the SAME on random canary prompts (perplexity drops as
+/// experts drop), because kenny has no tokenizer yet: random next-tokens carry no
+/// signal for an expert to preserve. The SIGN of a real quality dip needs real
+/// TEXT prompts (deferred). What holds model-free is the divergence-from-full
+/// signal being monotone in the down-fraction and cleanly recoverable — a proxy
+/// for "the output moved", not the direction of a quality change.
 #[test]
 fn renorm_quality_dip_grows_with_dropout() {
     let root = tmp("renorm-quality-dip");
@@ -2688,15 +2691,21 @@ fn real_model_perplexity_canary() {
 
 // -------------------------------------------------------------------------
 // M5.A — renorm quality dip under EXPERT DROPOUT against the REAL Qwen3-30B-A3B
-// (KENNY_MODEL_DIR). The fixture `renorm_quality_dip_grows_with_dropout` proves
-// the dip is monotone in the down-fraction and recoverable, but on random weights
-// the canary NLL cannot show the SIGN of a real perplexity loss (ADR-0007). This
-// arm reports the real number: teacher-forced perplexity of the fp8 path as a
-// growing fraction of experts is forced not-held across every MoE layer — the
-// "smooth quality dip, not an outage" ADR-0008 promises, measured on the real
-// card. Deliverable is the BENCH Δppl-under-dropout curve; budget-capped (a small
-// fixed prompt set, three dropout rungs) per the plan. Gated — CI never downloads
-// a model.
+// (KENNY_MODEL_DIR). Reports teacher-forced perplexity of the fp8 path as a growing
+// fraction of experts is forced not-held across every MoE layer. The deliverable is
+// the BENCH Δppl-under-dropout curve; budget-capped (a small fixed prompt set,
+// three dropout rungs) per the plan. Gated — CI never downloads a model.
+//
+// HONEST RESULT (measured 2026-07-22, recorded in BENCH "M5.A"): on RANDOM in-vocab
+// canary prompts (kenny has no tokenizer yet, ADR-0007) perplexity DECREASES under
+// dropout (~11.0M → 4.0M) rather than worsening — the SAME uniform-prior drift the
+// fixture NLL shows, and for the same reason: random next-tokens carry no signal
+// for an expert to preserve, so a confidently-wrong full model moving toward
+// uniform under dropout LOWERS its perplexity. The SIGN of a real quality dip
+// therefore needs real TEXT prompts (a tokenizer), which is deferred; the robust
+// model-free signal is the divergence-from-full-coverage metric that
+// `renorm_quality_dip_grows_with_dropout` locks. This arm asserts only finiteness
+// and reports the number — the direction is itself the finding, not a pass/fail.
 // -------------------------------------------------------------------------
 #[test]
 fn renorm_quality_dip_real_model() {
@@ -2753,7 +2762,6 @@ fn renorm_quality_dip_real_model() {
     );
     eprintln!("down_frac\tdropped/layer\tperplexity\tΔppl_vs_full\telapsed");
     let base = ppl(&[]);
-    let mut last = base;
     for &k in &[0usize, experts / 8, experts / 4] {
         let drops: Vec<(u16, u16)> = (0..moe_layers as u16)
             .flat_map(|l| (0..k as u16).map(move |e| (l, e)))
@@ -2766,18 +2774,14 @@ fn renorm_quality_dip_real_model() {
             p - base,
             t0.elapsed()
         );
+        // Finiteness is the only assertion — the Δppl-under-dropout number is the
+        // deliverable, and on random canary prompts its SIGN is the uniform-floor
+        // drift documented above (a real quality dip needs real text prompts).
         assert!(
             p.is_finite() && p > 0.0,
             "perplexity must be finite positive"
         );
-        last = p;
     }
-    // Real experts carry signal, so forcing a fraction not-held should degrade (not
-    // improve) perplexity — a loose floor; the number is the deliverable.
-    assert!(
-        last >= base * 0.999,
-        "dropping real experts should not IMPROVE perplexity: {last} < {base}"
-    );
 }
 
 // -------------------------------------------------------------------------
